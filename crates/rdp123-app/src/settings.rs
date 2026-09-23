@@ -21,11 +21,11 @@ use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThr
 use objc2_app_kit::{
     NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSBorderType, NSBox, NSBoxType,
     NSButton, NSColor, NSControlStateValueOff, NSControlStateValueOn, NSControlTextEditingDelegate,
-    NSFont, NSGridCell, NSGridCellPlacement, NSGridRowAlignment, NSGridView, NSImageView,
-    NSPasteboard, NSPasteboardTypeString, NSPopUpButton, NSScrollView, NSSecureTextField,
-    NSSegmentSwitchTracking, NSSegmentedControl, NSTableColumn, NSTableView, NSTableViewDataSource,
-    NSTableViewDelegate, NSTextAlignment, NSTextField, NSTextFieldDelegate, NSView, NSWindow,
-    NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
+    NSFont, NSGridCell, NSGridCellPlacement, NSGridRow, NSGridRowAlignment, NSGridView,
+    NSImageView, NSPasteboard, NSPasteboardTypeString, NSPopUpButton, NSScrollView,
+    NSSecureTextField, NSSegmentSwitchTracking, NSSegmentedControl, NSStackView, NSTableColumn,
+    NSTableView, NSTableViewDataSource, NSTableViewDelegate, NSTextAlignment, NSTextField,
+    NSTextFieldDelegate, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{
@@ -75,15 +75,8 @@ const SEG_H: f64 = 24.0;
 const EDIT_TOP: f64 = 690.0; // top of the first editor row
 const FORM_X: f64 = 224.0;
 const LABEL_W: f64 = 150.0;
-const FIELD_X: f64 = 382.0;
 const FIELD_W: f64 = 322.0;
 const ROW_H: f64 = 22.0;
-const PITCH: f64 = 24.0;
-// Pop-up buttons are 24 points tall, so give their rows a visible gutter.
-const POPUP_PITCH: f64 = 26.0;
-// Checkboxes need less vertical air than bordered form controls.
-const CHECKBOX_PITCH: f64 = 22.0;
-const HDR_PITCH: f64 = 26.0;
 
 fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
     CGRect::new(CGPoint::new(x, y), CGSize::new(w, h))
@@ -120,8 +113,8 @@ pub struct SettingsIvars {
     remove_button: Check,
     /// Shown in the editor area when no connection is selected.
     empty_label: RefCell<Option<Retained<NSTextField>>>,
-    /// Editor controls shared by RDP and SSH (hidden when nothing is selected).
-    common_group: RefCell<Vec<Retained<NSView>>>,
+    /// Editor rows shared by RDP and SSH (hidden when nothing is selected).
+    common_group: RefCell<Vec<Retained<NSGridRow>>>,
 
     // Common (RDP + SSH)
     name: Field,
@@ -161,10 +154,10 @@ pub struct SettingsIvars {
     /// the system's `SMAppService` status.
     launch_at_login: Check,
 
-    rdp_group: RefCell<Vec<Retained<NSView>>>,
-    password_auth_group: RefCell<Vec<Retained<NSView>>>,
-    entra_auth_group: RefCell<Vec<Retained<NSView>>>,
-    ssh_group: RefCell<Vec<Retained<NSView>>>,
+    rdp_group: RefCell<Vec<Retained<NSGridRow>>>,
+    password_auth_group: RefCell<Vec<Retained<NSGridRow>>>,
+    entra_auth_group: RefCell<Vec<Retained<NSGridRow>>>,
+    ssh_group: RefCell<Vec<Retained<NSGridRow>>>,
 }
 
 define_class!(
@@ -722,188 +715,112 @@ impl SettingsController {
         self.muted(&empty);
         *self.ivars().empty_label.borrow_mut() = Some(empty);
 
-        // ---- common fields (hidden while nothing is selected) ----
-        let mut common = Vec::new();
-        let mut y = EDIT_TOP;
-        self.header_g(mtm, parent, &mut y, "Connection", &mut common);
-        let name = self.text_row_g(mtm, parent, &mut y, "Name:", &mut common);
-        name.setPlaceholderString(Some(&NSString::from_str("Office PC")));
-        *self.ivars().name.borrow_mut() = Some(name);
-        *self.ivars().kind.borrow_mut() = Some(self.popup_row_g(
-            mtm,
-            parent,
-            &mut y,
-            "Type:",
-            &["RDP", "SSH"],
-            sel!(typeChanged:),
-            120.0,
-            &mut common,
-        ));
-        let host = self.text_row_g(mtm, parent, &mut y, "Host:", &mut common);
-        host.setPlaceholderString(Some(&NSString::from_str("hostname or IP address")));
-        *self.ivars().host.borrow_mut() = Some(host);
-        let port = self.text_row_g(mtm, parent, &mut y, "Port:", &mut common);
-        port.setPlaceholderString(Some(&NSString::from_str("3389")));
-        *self.ivars().port.borrow_mut() = Some(port);
+        // ---- editor: one grid, rows listed in order ----
+        // Every row belongs to a group; `update_visibility` hides whole rows,
+        // and a hidden grid row takes no space, so RDP and SSH layouts need
+        // no shared coordinates.
+        #[derive(Clone, Copy)]
+        enum Group {
+            Common,
+            Rdp,
+            PasswordAuth,
+            EntraAuth,
+            Ssh,
+        }
+        let label = |text: &str| NSTextField::labelWithString(&NSString::from_str(text), mtm);
+        let muted = |text: &str| {
+            let l = label(text);
+            self.muted(&l);
+            l
+        };
+        let text = |placeholder: &str, width: f64| {
+            let t = NSTextField::initWithFrame(NSTextField::alloc(mtm), CGRect::ZERO);
+            unsafe { t.setDelegate(Some(ProtocolObject::from_ref(self))) };
+            t.setPlaceholderString(Some(&NSString::from_str(placeholder)));
+            t.widthAnchor()
+                .constraintEqualToConstant(width)
+                .setActive(true);
+            t
+        };
+        let popup = |items: &[&str], action: Sel, width: f64| {
+            let p = NSPopUpButton::initWithFrame_pullsDown(
+                NSPopUpButton::alloc(mtm),
+                CGRect::ZERO,
+                false,
+            );
+            for it in items {
+                p.addItemWithTitle(&NSString::from_str(it));
+            }
+            unsafe {
+                p.setTarget(Some(self.any()));
+                p.setAction(Some(action));
+            }
+            p.widthAnchor()
+                .constraintEqualToConstant(width)
+                .setActive(true);
+            p
+        };
+        let checkbox = |title: &str| unsafe {
+            NSButton::checkboxWithTitle_target_action(
+                &NSString::from_str(title),
+                Some(self.any()),
+                Some(dirty),
+                mtm,
+            )
+        };
+        let view = |v: &NSView| -> Retained<NSView> { v.retain() };
+        let empty = || NSGridCell::emptyContentView(mtm);
+        // (label cell, control cell, group, spans both columns, space above)
+        let field = |l: &str, c: &NSView, g| (view(&label(l)), view(c), g, false, 0.0);
+        let control = |c: &NSView, g| (empty(), view(c), g, false, 0.0);
+        let wide = |v: &NSView, g| (view(v), empty(), g, true, 0.0);
+        let heading = |t: &str, g| {
+            let l = label(t);
+            l.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
+            (view(&l), empty(), g, true, 6.0)
+        };
 
-        // RDP and SSH groups share the region below the common fields.
-        let group_top = y;
-
-        // ---- RDP group ----
-        let mut rdp = Vec::new();
-        let mut yr = group_top;
-
-        self.header_g(mtm, parent, &mut yr, "Authentication", &mut rdp);
-        let authentication = self.popup_row_g(
-            mtm,
-            parent,
-            &mut yr,
-            "Method:",
+        let name = text("Office PC", FIELD_W);
+        let kind = popup(&["RDP", "SSH"], sel!(typeChanged:), 120.0);
+        let host = text("hostname or IP address", FIELD_W);
+        let port = text("3389", FIELD_W);
+        let authentication = popup(
             &["Password (NLA)", "Microsoft Entra web"],
             sel!(authenticationChanged:),
             210.0,
-            &mut rdp,
         );
-        *self.ivars().authentication.borrow_mut() = Some(authentication);
-        // The username applies to RDP and SSH alike, and both layouts have a
-        // row at this position (under "Authentication" and under "SSH"), so
-        // the field lives in the common group at shared coordinates.
-        let user = self.text_row_g(mtm, parent, &mut yr, "Username:", &mut common);
-        user.setPlaceholderString(Some(&NSString::from_str("user or user@company.com")));
-        *self.ivars().user.borrow_mut() = Some(user);
-        let password_start = rdp.len();
-        let password_top = yr;
-        *self.ivars().domain.borrow_mut() =
-            Some(self.text_row_g(mtm, parent, &mut yr, "Domain:", &mut rdp));
-        let pw = self.secure_row_g(mtm, parent, &mut yr, "Password:", &mut rdp);
-        pw.setPlaceholderString(Some(&NSString::from_str("(unchanged)")));
-        *self.ivars().password.borrow_mut() = Some(pw);
-        *self.ivars().pw_policy.borrow_mut() = Some(self.popup_row_g(
+        let user = text("user or user@company.com", FIELD_W);
+        let domain = text("", FIELD_W);
+        let password =
+            NSSecureTextField::initWithFrame(NSSecureTextField::alloc(mtm), CGRect::ZERO);
+        unsafe { password.setDelegate(Some(ProtocolObject::from_ref(self))) };
+        password.setPlaceholderString(Some(&NSString::from_str("(unchanged)")));
+        password
+            .widthAnchor()
+            .constraintEqualToConstant(FIELD_W)
+            .setActive(true);
+        let pw_policy = popup(&["Remember (Keychain)", "Always ask"], dirty, 210.0);
+        let res_mode = popup(&["Fit to window", "Fixed"], sel!(resModeChanged:), 160.0);
+        let res_w = text("1920", 70.0);
+        let res_h = text("1080", 70.0);
+        let fixed_size = NSStackView::stackViewWithViews(
+            &NSArray::from_retained_slice(&[view(&res_w), view(&label("×")), view(&res_h)]),
             mtm,
-            parent,
-            &mut yr,
-            "Password handling:",
-            &["Remember (Keychain)", "Always ask"],
-            dirty,
-            210.0,
-            &mut rdp,
-        ));
-        *self.ivars().password_auth_group.borrow_mut() = rdp[password_start..].to_vec();
-
-        let entra_line_1 = self.label(
-            mtm,
-            parent,
-            rect(FIELD_X, password_top, FIELD_W, ROW_H),
-            "Signs in interactively with your Microsoft account.",
         );
-        self.muted(&entra_line_1);
-        rdp.push(unsafe { Retained::cast_unchecked(entra_line_1.clone()) });
-        let entra_line_2 = self.label(
-            mtm,
-            parent,
-            rect(FIELD_X, password_top - PITCH, FIELD_W, ROW_H),
-            "Hostname required; IP addresses are not supported.",
-        );
-        self.muted(&entra_line_2);
-        rdp.push(unsafe { Retained::cast_unchecked(entra_line_2.clone()) });
-        let entra_line_3 = self.label(
-            mtm,
-            parent,
-            rect(FIELD_X, password_top - 2.0 * PITCH, FIELD_W, ROW_H),
-            "No RDP password or domain is stored or sent.",
-        );
-        self.muted(&entra_line_3);
-        rdp.push(unsafe { Retained::cast_unchecked(entra_line_3.clone()) });
-        *self.ivars().entra_auth_group.borrow_mut() = vec![
-            unsafe { Retained::cast_unchecked(entra_line_1) },
-            unsafe { Retained::cast_unchecked(entra_line_2) },
-            unsafe { Retained::cast_unchecked(entra_line_3) },
-        ];
-
-        self.header_g(mtm, parent, &mut yr, "Display", &mut rdp);
-        *self.ivars().res_mode.borrow_mut() = Some(self.popup_row_g(
-            mtm,
-            parent,
-            &mut yr,
-            "Resolution:",
-            &["Fit to window", "Fixed"],
-            sel!(resModeChanged:),
-            160.0,
-            &mut rdp,
-        ));
-        {
-            let label = self.row_label(mtm, parent, yr, "Fixed size:");
-            rdp.push(unsafe { Retained::cast_unchecked(label) });
-            let w = self.plain_text(mtm, parent, rect(FIELD_X, yr, 70.0, ROW_H));
-            w.setPlaceholderString(Some(&NSString::from_str("1920")));
-            let x = self.label(mtm, parent, rect(FIELD_X + 76.0, yr, 16.0, ROW_H), "×");
-            let h = self.plain_text(mtm, parent, rect(FIELD_X + 96.0, yr, 70.0, ROW_H));
-            h.setPlaceholderString(Some(&NSString::from_str("1080")));
-            rdp.push(unsafe { Retained::cast_unchecked(w.clone()) });
-            rdp.push(unsafe { Retained::cast_unchecked(x) });
-            rdp.push(unsafe { Retained::cast_unchecked(h.clone()) });
-            *self.ivars().res_w.borrow_mut() = Some(w);
-            *self.ivars().res_h.borrow_mut() = Some(h);
-            yr -= PITCH;
-        }
-        *self.ivars().scaling.borrow_mut() = Some(self.popup_row_g(
-            mtm,
-            parent,
-            &mut yr,
-            "Scaling:",
-            &["Auto", "100%", "140%", "180%", "200%"],
-            dirty,
-            120.0,
-            &mut rdp,
-        ));
-        *self.ivars().color.borrow_mut() = Some(self.popup_row_g(
-            mtm,
-            parent,
-            &mut yr,
-            "Color quality:",
-            &["High (32-bit)", "Medium (16-bit)"],
-            dirty,
-            180.0,
-            &mut rdp,
-        ));
-        *self.ivars().graphics.borrow_mut() = Some(self.popup_row_g(
-            mtm,
-            parent,
-            &mut yr,
-            "Graphics:",
+        fixed_size.setSpacing(6.0);
+        let scaling = popup(&["Auto", "100%", "140%", "180%", "200%"], dirty, 120.0);
+        let color = popup(&["High (32-bit)", "Medium (16-bit)"], dirty, 180.0);
+        let graphics = popup(
             &["RDP 8.0 (Experimental)", "RDP 6.1 (Classic bitmaps)"],
             dirty,
             240.0,
-            &mut rdp,
-        ));
+        );
         // This controls the outer FastPath/XCRUSH transport layer in either
         // graphics mode. EGFX additionally manages ZGFX and codec compression.
-        let comp = self.checkbox_fit(
-            mtm,
-            parent,
-            FIELD_X,
-            yr,
-            "Transport compression (recommended)",
-            dirty,
-        );
-        rdp.push(unsafe { Retained::cast_unchecked(comp.clone()) });
-        *self.ivars().compression.borrow_mut() = Some(comp);
-        yr -= CHECKBOX_PITCH;
-        let fs = self.checkbox_fit(mtm, parent, FIELD_X, yr, "Start in full screen", dirty);
-        rdp.push(unsafe { Retained::cast_unchecked(fs.clone()) });
-        *self.ivars().fullscreen.borrow_mut() = Some(fs);
-        yr -= CHECKBOX_PITCH;
-        let rs = self.checkbox_fit(mtm, parent, FIELD_X, yr, "Remember window size", dirty);
-        rdp.push(unsafe { Retained::cast_unchecked(rs.clone()) });
-        *self.ivars().remember_size.borrow_mut() = Some(rs);
-        yr -= CHECKBOX_PITCH;
-
-        self.header_g(mtm, parent, &mut yr, "Clipboard, sound & session", &mut rdp);
-        *self.ivars().clipboard.borrow_mut() = Some(self.popup_row_g(
-            mtm,
-            parent,
-            &mut yr,
-            "Clipboard:",
+        let compression = checkbox("Transport compression (recommended)");
+        let fullscreen = checkbox("Start in full screen");
+        let remember_size = checkbox("Remember window size");
+        let clipboard = popup(
             &[
                 "Bidirectional",
                 "Disabled",
@@ -912,76 +829,156 @@ impl SettingsController {
             ],
             dirty,
             200.0,
-            &mut rdp,
-        ));
-        *self.ivars().audio.borrow_mut() = Some(self.popup_row_g(
-            mtm,
-            parent,
-            &mut yr,
-            "Play sound:",
+        );
+        let audio = popup(
             &["On this computer", "Never", "On the remote computer"],
             dirty,
             220.0,
-            &mut rdp,
-        ));
-        let re = self.checkbox_fit(
-            mtm,
-            parent,
-            FIELD_X,
-            yr,
-            "Automatically reconnect after connection drops",
-            dirty,
         );
-        rdp.push(unsafe { Retained::cast_unchecked(re.clone()) });
-        *self.ivars().reconnect.borrow_mut() = Some(re);
-        yr -= CHECKBOX_PITCH;
-        {
-            let label = self.row_label(mtm, parent, yr, "Max attempts/minute:");
-            rdp.push(unsafe { Retained::cast_unchecked(label) });
-            let rate = self.plain_text(mtm, parent, rect(FIELD_X, yr, 60.0, ROW_H));
-            rdp.push(unsafe { Retained::cast_unchecked(rate.clone()) });
-            *self.ivars().rate.borrow_mut() = Some(rate);
-            yr -= PITCH;
-        }
-        let ka = self.checkbox_fit(mtm, parent, FIELD_X, yr, "Keep session awake", dirty);
-        ka.setToolTip(Some(&NSString::from_str(
+        let reconnect = checkbox("Automatically reconnect after connection drops");
+        let rate = text("", 60.0);
+        let keep_alive = checkbox("Keep session awake");
+        keep_alive.setToolTip(Some(&NSString::from_str(
             "While idle, taps an invisible key so the remote session is not \
              disconnected or locked. Also keeps the host from auto-locking.",
         )));
-        rdp.push(unsafe { Retained::cast_unchecked(ka.clone()) });
-        *self.ivars().keep_alive.borrow_mut() = Some(ka);
-        yr -= CHECKBOX_PITCH;
-        let wake = self.text_row_g(mtm, parent, &mut yr, "Wake on LAN (MAC):", &mut rdp);
-        wake.setPlaceholderString(Some(&NSString::from_str("AA:BB:CC:DD:EE:FF (optional)")));
-        *self.ivars().wake_mac.borrow_mut() = Some(wake);
+        let wake_mac = text("AA:BB:CC:DD:EE:FF (optional)", FIELD_W);
 
-        // ---- SSH group ----
-        let mut ssh = Vec::new();
-        let mut ys = group_top;
-        self.header_g(mtm, parent, &mut ys, "SSH", &mut ssh);
-        // The shared Username row (common group) occupies this first slot.
-        ys -= PITCH;
-        let l1 = self.label(
-            mtm,
-            parent,
-            rect(FORM_X, ys, FIELD_W + LABEL_W, ROW_H),
-            "Opens in the terminal chosen under the “Global” tab.",
-        );
-        self.muted(&l1);
-        ssh.push(unsafe { Retained::cast_unchecked(l1) });
-        ys -= PITCH;
-        let l2 = self.label(
-            mtm,
-            parent,
-            rect(FORM_X, ys, FIELD_W + LABEL_W, ROW_H),
-            "Authenticates with your SSH keys — no password is handled here.",
-        );
-        self.muted(&l2);
-        ssh.push(unsafe { Retained::cast_unchecked(l2) });
+        use Group::*;
+        let mut rows = vec![
+            heading("Connection", Common),
+            field("Name:", &name, Common),
+            field("Type:", &kind, Common),
+            field("Host:", &host, Common),
+            field("Port:", &port, Common),
+            heading("Authentication", Rdp),
+            heading("SSH", Ssh),
+            field("Method:", &authentication, Rdp),
+            field("Username:", &user, Common),
+            wide(
+                &muted("Opens in the terminal chosen under the “Global” tab."),
+                Ssh,
+            ),
+            wide(
+                &muted("Authenticates with your SSH keys — no password is handled here."),
+                Ssh,
+            ),
+            field("Domain:", &domain, PasswordAuth),
+            field("Password:", &password, PasswordAuth),
+            field("Password handling:", &pw_policy, PasswordAuth),
+            control(
+                &muted("Signs in interactively with your Microsoft account."),
+                EntraAuth,
+            ),
+            control(
+                &muted("Hostname required; IP addresses are not supported."),
+                EntraAuth,
+            ),
+            control(
+                &muted("No RDP password or domain is stored or sent."),
+                EntraAuth,
+            ),
+            heading("Display", Rdp),
+            field("Resolution:", &res_mode, Rdp),
+            field("Fixed size:", &fixed_size, Rdp),
+            field("Scaling:", &scaling, Rdp),
+            field("Color quality:", &color, Rdp),
+            field("Graphics:", &graphics, Rdp),
+            control(&compression, Rdp),
+            control(&fullscreen, Rdp),
+            control(&remember_size, Rdp),
+            heading("Clipboard, sound & session", Rdp),
+            field("Clipboard:", &clipboard, Rdp),
+            field("Play sound:", &audio, Rdp),
+            control(&reconnect, Rdp),
+            field("Max attempts/minute:", &rate, Rdp),
+            control(&keep_alive, Rdp),
+            field("Wake on LAN (MAC):", &wake_mac, Rdp),
+        ];
+        rows[0].4 = 0.0; // no gap above the first heading
 
-        *self.ivars().common_group.borrow_mut() = common;
-        *self.ivars().rdp_group.borrow_mut() = rdp;
-        *self.ivars().ssh_group.borrow_mut() = ssh;
+        let grid_rows: Vec<Retained<NSArray<NSView>>> = rows
+            .iter()
+            .map(|(l, c, ..)| NSArray::from_retained_slice(&[l.clone(), c.clone()]))
+            .collect();
+        let grid = NSGridView::gridViewWithViews(&NSArray::from_retained_slice(&grid_rows), mtm);
+        grid.setRowSpacing(2.0);
+        grid.setColumnSpacing(8.0);
+        grid.setRowAlignment(NSGridRowAlignment::FirstBaseline);
+        let labels = grid.columnAtIndex(0);
+        labels.setXPlacement(NSGridCellPlacement::Trailing);
+        labels.setWidth(LABEL_W);
+        grid.columnAtIndex(1)
+            .setXPlacement(NSGridCellPlacement::Leading);
+
+        let (mut common, mut rdp, mut password_auth, mut entra_auth, mut ssh) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for (i, (_, _, group, spans, top)) in rows.iter().enumerate() {
+            let index = i as isize;
+            let row = grid.rowAtIndex(index);
+            row.setTopPadding(*top);
+            if *spans {
+                grid.mergeCellsInHorizontalRange_verticalRange(
+                    NSRange::new(0, 2),
+                    NSRange::new(i, 1),
+                );
+                grid.cellAtColumnIndex_rowIndex(0, index)
+                    .setXPlacement(NSGridCellPlacement::Leading);
+            }
+            match group {
+                Common => common.push(row),
+                Rdp => rdp.push(row),
+                PasswordAuth => {
+                    rdp.push(row.clone());
+                    password_auth.push(row);
+                }
+                EntraAuth => {
+                    rdp.push(row.clone());
+                    entra_auth.push(row);
+                }
+                Ssh => ssh.push(row),
+            }
+        }
+
+        grid.setTranslatesAutoresizingMaskIntoConstraints(false);
+        parent.addSubview(&grid);
+        grid.topAnchor()
+            .constraintEqualToAnchor_constant(&parent.topAnchor(), CH - EDIT_TOP - 20.0)
+            .setActive(true);
+        grid.leadingAnchor()
+            .constraintEqualToAnchor_constant(&parent.leadingAnchor(), FORM_X)
+            .setActive(true);
+
+        let ivars = self.ivars();
+        *ivars.name.borrow_mut() = Some(name);
+        *ivars.kind.borrow_mut() = Some(kind);
+        *ivars.host.borrow_mut() = Some(host);
+        *ivars.port.borrow_mut() = Some(port);
+        *ivars.authentication.borrow_mut() = Some(authentication);
+        *ivars.user.borrow_mut() = Some(user);
+        *ivars.domain.borrow_mut() = Some(domain);
+        *ivars.password.borrow_mut() = Some(password);
+        *ivars.pw_policy.borrow_mut() = Some(pw_policy);
+        *ivars.res_mode.borrow_mut() = Some(res_mode);
+        *ivars.res_w.borrow_mut() = Some(res_w);
+        *ivars.res_h.borrow_mut() = Some(res_h);
+        *ivars.scaling.borrow_mut() = Some(scaling);
+        *ivars.color.borrow_mut() = Some(color);
+        *ivars.graphics.borrow_mut() = Some(graphics);
+        *ivars.compression.borrow_mut() = Some(compression);
+        *ivars.fullscreen.borrow_mut() = Some(fullscreen);
+        *ivars.remember_size.borrow_mut() = Some(remember_size);
+        *ivars.clipboard.borrow_mut() = Some(clipboard);
+        *ivars.audio.borrow_mut() = Some(audio);
+        *ivars.reconnect.borrow_mut() = Some(reconnect);
+        *ivars.rate.borrow_mut() = Some(rate);
+        *ivars.keep_alive.borrow_mut() = Some(keep_alive);
+        *ivars.wake_mac.borrow_mut() = Some(wake_mac);
+        *ivars.common_group.borrow_mut() = common;
+        *ivars.rdp_group.borrow_mut() = rdp;
+        *ivars.password_auth_group.borrow_mut() = password_auth;
+        *ivars.entra_auth_group.borrow_mut() = entra_auth;
+        *ivars.ssh_group.borrow_mut() = ssh;
     }
 
     /// Laid out by an `NSGridView`: a right-aligned label column and a control
@@ -1158,19 +1155,6 @@ impl SettingsController {
         l
     }
 
-    /// A right-aligned label for the form's label column (macOS convention).
-    fn row_label(
-        &self,
-        mtm: MainThreadMarker,
-        parent: &NSView,
-        y: f64,
-        text: &str,
-    ) -> Retained<NSTextField> {
-        let l = self.label(mtm, parent, rect(FORM_X, y, LABEL_W, ROW_H), text);
-        l.setAlignment(NSTextAlignment::Right);
-        l
-    }
-
     /// Colour a label as secondary/muted text.
     fn muted(&self, label: &NSTextField) {
         label.setTextColor(Some(&NSColor::secondaryLabelColor()));
@@ -1194,32 +1178,6 @@ impl SettingsController {
         parent.addSubview(&b);
     }
 
-    fn header_g(
-        &self,
-        mtm: MainThreadMarker,
-        parent: &NSView,
-        y: &mut f64,
-        text: &str,
-        group: &mut Vec<Retained<NSView>>,
-    ) {
-        let l = self.label(mtm, parent, rect(FORM_X, *y, 460.0, 20.0), text);
-        l.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
-        group.push(unsafe { Retained::cast_unchecked(l) });
-        *y -= HDR_PITCH;
-    }
-
-    fn plain_text(
-        &self,
-        mtm: MainThreadMarker,
-        parent: &NSView,
-        f: CGRect,
-    ) -> Retained<NSTextField> {
-        let t = NSTextField::initWithFrame(NSTextField::alloc(mtm), f);
-        unsafe { t.setDelegate(Some(ProtocolObject::from_ref(self))) };
-        parent.addSubview(&t);
-        t
-    }
-
     fn button_ret(
         &self,
         mtm: MainThreadMarker,
@@ -1239,112 +1197,6 @@ impl SettingsController {
         b.setFrame(f);
         parent.addSubview(&b);
         b
-    }
-
-    /// A checkbox sized to its title so the label never truncates.
-    fn checkbox_fit(
-        &self,
-        mtm: MainThreadMarker,
-        parent: &NSView,
-        x: f64,
-        y: f64,
-        title: &str,
-        action: Sel,
-    ) -> Retained<NSButton> {
-        let b = unsafe {
-            NSButton::checkboxWithTitle_target_action(
-                &NSString::from_str(title),
-                Some(self.any()),
-                Some(action),
-                mtm,
-            )
-        };
-        b.setFrame(rect(x, y, 240.0, ROW_H));
-        b.sizeToFit();
-        parent.addSubview(&b);
-        b
-    }
-
-    fn text_row_g(
-        &self,
-        mtm: MainThreadMarker,
-        parent: &NSView,
-        y: &mut f64,
-        label: &str,
-        group: &mut Vec<Retained<NSView>>,
-    ) -> Retained<NSTextField> {
-        let l = self.row_label(mtm, parent, *y, label);
-        let t = self.plain_text(mtm, parent, rect(FIELD_X, *y, FIELD_W, ROW_H));
-        group.push(unsafe { Retained::cast_unchecked(l) });
-        group.push(unsafe { Retained::cast_unchecked(t.clone()) });
-        *y -= PITCH;
-        t
-    }
-
-    fn secure_row_g(
-        &self,
-        mtm: MainThreadMarker,
-        parent: &NSView,
-        y: &mut f64,
-        label: &str,
-        group: &mut Vec<Retained<NSView>>,
-    ) -> Retained<NSSecureTextField> {
-        let l = self.row_label(mtm, parent, *y, label);
-        let t = NSSecureTextField::initWithFrame(
-            NSSecureTextField::alloc(mtm),
-            rect(FIELD_X, *y, FIELD_W, ROW_H),
-        );
-        unsafe { t.setDelegate(Some(ProtocolObject::from_ref(self))) };
-        parent.addSubview(&t);
-        group.push(unsafe { Retained::cast_unchecked(l) });
-        group.push(unsafe { Retained::cast_unchecked(t.clone()) });
-        *y -= PITCH;
-        t
-    }
-
-    fn popup_row_g(
-        &self,
-        mtm: MainThreadMarker,
-        parent: &NSView,
-        y: &mut f64,
-        label: &str,
-        items: &[&str],
-        action: Sel,
-        w: f64,
-        group: &mut Vec<Retained<NSView>>,
-    ) -> Retained<NSPopUpButton> {
-        let l = self.row_label(mtm, parent, *y, label);
-        let p = self.popup(
-            mtm,
-            parent,
-            rect(FIELD_X, *y, w, ROW_H + 2.0),
-            items,
-            action,
-        );
-        group.push(unsafe { Retained::cast_unchecked(l) });
-        group.push(unsafe { Retained::cast_unchecked(p.clone()) });
-        *y -= POPUP_PITCH;
-        p
-    }
-
-    fn popup(
-        &self,
-        mtm: MainThreadMarker,
-        parent: &NSView,
-        f: CGRect,
-        items: &[&str],
-        action: Sel,
-    ) -> Retained<NSPopUpButton> {
-        let p = NSPopUpButton::initWithFrame_pullsDown(NSPopUpButton::alloc(mtm), f, false);
-        for it in items {
-            p.addItemWithTitle(&NSString::from_str(it));
-        }
-        unsafe {
-            p.setTarget(Some(self.any()));
-            p.setAction(Some(action));
-        }
-        parent.addSubview(&p);
-        p
     }
 
     fn any(&self) -> &AnyObject {
