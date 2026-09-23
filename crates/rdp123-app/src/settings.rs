@@ -22,7 +22,7 @@ use objc2_app_kit::{
     NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSBorderType, NSBox, NSBoxType,
     NSButton, NSColor, NSControlStateValueOff, NSControlStateValueOn, NSControlTextEditingDelegate,
     NSFont, NSGridCell, NSGridCellPlacement, NSGridRow, NSGridRowAlignment, NSGridView, NSImage,
-    NSImageView, NSPasteboard, NSPasteboardTypeString, NSPopUpButton, NSScrollView,
+    NSImageView, NSPasteboard, NSPasteboardTypeString, NSPopUpButton, NSScreen, NSScrollView,
     NSSecureTextField, NSStackView, NSTableColumn, NSTableView, NSTableViewDataSource,
     NSTableViewDelegate, NSTextAlignment, NSTextField, NSTextFieldDelegate, NSToolbar,
     NSToolbarDelegate, NSToolbarDisplayMode, NSToolbarItem, NSView, NSWindow, NSWindowDelegate,
@@ -70,10 +70,11 @@ const AUTHENTICATION: [AuthenticationMode; 2] =
 
 // Window / layout geometry.
 const W: f64 = 720.0;
-const CH: f64 = 800.0; // content height (below the toolbar)
-/// The About pane's frame math is written for this height; it is shifted up
-/// to the top of the taller content area.
-const ABOUT_H: f64 = 716.0;
+/// Content height the panes are built at, and the About pane's height. The
+/// window then resizes to fit whichever pane is visible.
+const CH: f64 = 716.0;
+/// Strip along the bottom of the Connections pane for +/− and Revert/Save.
+const BUTTON_BAR: f64 = 56.0;
 const GRID_TOP: f64 = 20.0; // space above the first grid row
 const INDENT: f64 = 20.0; // leading indent of a control that depends on the row above
 const FORM_X: f64 = 224.0;
@@ -122,9 +123,11 @@ pub struct SettingsIvars {
     /// window returns to the pane people used last.
     pane: Cell<usize>,
     toolbar: RefCell<Option<Retained<NSToolbar>>>,
-    conn_pane: RefCell<Option<Retained<NSScrollView>>>,
-    global_pane: RefCell<Option<Retained<NSScrollView>>>,
-    about_pane: RefCell<Option<Retained<NSScrollView>>>,
+    conn_pane: RefCell<Option<Retained<NSView>>>,
+    global_pane: RefCell<Option<Retained<NSView>>>,
+    about_pane: RefCell<Option<Retained<NSView>>>,
+    /// Preferred content height of each pane, in `PANES` order.
+    pane_heights: Cell<[f64; 3]>,
     save_button: Check,
     revert_button: Check,
     remove_button: Check,
@@ -433,6 +436,28 @@ define_class!(
     }
 );
 
+define_class!(
+    /// A view whose origin is its top-left corner, so a scroll view showing it
+    /// starts at the top.
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "RDP123FlippedView"]
+    struct FlippedView;
+
+    impl FlippedView {
+        #[unsafe(method(isFlipped))]
+        fn is_flipped(&self) -> bool {
+            true
+        }
+    }
+);
+
+impl FlippedView {
+    fn new(mtm: MainThreadMarker, frame: CGRect) -> Retained<Self> {
+        unsafe { msg_send![Self::alloc(mtm), initWithFrame: frame] }
+    }
+}
+
 impl SettingsController {
     pub fn new(mtm: MainThreadMarker, store: ProfileStore) -> Retained<Self> {
         let ivars = SettingsIvars::default();
@@ -514,57 +539,30 @@ impl SettingsController {
         window.setToolbar(Some(&toolbar));
         *self.ivars().toolbar.borrow_mut() = Some(toolbar);
 
-        // ---- panes ----
-        let conn_scroll =
-            NSScrollView::initWithFrame(NSScrollView::alloc(mtm), rect(0.0, 0.0, W, CH));
-        conn_scroll.setBorderType(NSBorderType::NoBorder);
-        conn_scroll.setHasVerticalScroller(true);
-        conn_scroll.setHasHorizontalScroller(true);
-        conn_scroll.setAutohidesScrollers(true);
-        conn_scroll.setDrawsBackground(false);
-        conn_scroll.setAutoresizingMask(
-            NSAutoresizingMaskOptions::ViewWidthSizable
-                | NSAutoresizingMaskOptions::ViewHeightSizable,
-        );
-        let global_scroll =
-            NSScrollView::initWithFrame(NSScrollView::alloc(mtm), rect(0.0, 0.0, W, CH));
-        global_scroll.setBorderType(NSBorderType::NoBorder);
-        global_scroll.setHasVerticalScroller(true);
-        global_scroll.setHasHorizontalScroller(true);
-        global_scroll.setAutohidesScrollers(true);
-        global_scroll.setDrawsBackground(false);
-        global_scroll.setAutoresizingMask(
-            NSAutoresizingMaskOptions::ViewWidthSizable
-                | NSAutoresizingMaskOptions::ViewHeightSizable,
-        );
+        // ---- panes: each fills the content view; the window fits the
+        // visible pane's preferred height (see `fit_window_to_pane`) ----
+        let pane_view = || {
+            let v = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, W, CH));
+            v.setAutoresizingMask(
+                NSAutoresizingMaskOptions::ViewWidthSizable
+                    | NSAutoresizingMaskOptions::ViewHeightSizable,
+            );
+            content.addSubview(&v);
+            v
+        };
+        let conn = pane_view();
+        let global = pane_view();
+        let about = pane_view();
+        let conn_height = self.build_connection_pane(mtm, &conn);
+        let global_height = self.build_global_pane(mtm, &global);
+        let about_height = self.build_about_pane(mtm, &about);
+        self.ivars()
+            .pane_heights
+            .set([conn_height, global_height, about_height]);
 
-        let about_scroll =
-            NSScrollView::initWithFrame(NSScrollView::alloc(mtm), rect(0.0, 0.0, W, CH));
-        about_scroll.setBorderType(NSBorderType::NoBorder);
-        about_scroll.setHasVerticalScroller(true);
-        about_scroll.setAutohidesScrollers(true);
-        about_scroll.setDrawsBackground(false);
-        about_scroll.setAutoresizingMask(
-            NSAutoresizingMaskOptions::ViewWidthSizable
-                | NSAutoresizingMaskOptions::ViewHeightSizable,
-        );
-
-        let conn = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, W, CH));
-        let global = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, W, CH));
-        let about = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, W, CH));
-        self.build_connection_pane(mtm, &conn);
-        self.build_global_pane(mtm, &global);
-        self.build_about_pane(mtm, &about);
-        conn_scroll.setDocumentView(Some(&conn));
-        global_scroll.setDocumentView(Some(&global));
-        about_scroll.setDocumentView(Some(&about));
-        content.addSubview(&conn_scroll);
-        content.addSubview(&global_scroll);
-        content.addSubview(&about_scroll);
-
-        *self.ivars().conn_pane.borrow_mut() = Some(conn_scroll);
-        *self.ivars().global_pane.borrow_mut() = Some(global_scroll);
-        *self.ivars().about_pane.borrow_mut() = Some(about_scroll);
+        *self.ivars().conn_pane.borrow_mut() = Some(conn);
+        *self.ivars().global_pane.borrow_mut() = Some(global);
+        *self.ivars().about_pane.borrow_mut() = Some(about);
         *self.ivars().window.borrow_mut() = Some(window);
     }
 
@@ -583,10 +581,20 @@ impl SettingsController {
     }
 
     /// Standard macOS "About" layout: icon, name, version, then the libraries.
-    fn build_about_pane(&self, mtm: MainThreadMarker, parent: &NSView) {
-        // Everything but the bottom license line keeps its distance from the
-        // top of the pane.
-        let up = CH - ABOUT_H;
+    /// Returns the pane's preferred content height, which grows with the
+    /// library list.
+    fn build_about_pane(&self, mtm: MainThreadMarker, parent: &NSView) -> f64 {
+        let libs: Vec<(&str, &str)> = env!("RDP123_LIBS")
+            .split(';')
+            .filter(|s| !s.is_empty())
+            .map(|entry| entry.split_once(' ').unwrap_or((entry, "")))
+            .collect();
+        let rows = libs.len().div_ceil(2);
+        // Keep the last library row clear of the license line: when the list
+        // is longer than the base layout allows, grow the pane and move
+        // everything above the license line up by the difference.
+        let lowest_row = 356.0 - rows.saturating_sub(1) as f64 * 19.0;
+        let up = (60.0 - lowest_row).max(0.0);
 
         // App icon, centered.
         if let Some(icon) = NSApplication::sharedApplication(mtm).applicationIconImage() {
@@ -652,12 +660,6 @@ impl SettingsController {
         note.setFont(Some(&NSFont::systemFontOfSize(11.0)));
         self.muted(&note);
 
-        let libs: Vec<(&str, &str)> = env!("RDP123_LIBS")
-            .split(';')
-            .filter(|s| !s.is_empty())
-            .map(|entry| entry.split_once(' ').unwrap_or((entry, "")))
-            .collect();
-        let rows = libs.len().div_ceil(2);
         for (i, (name, version)) in libs.iter().enumerate() {
             let col_x = if i < rows { 68.0 } else { 374.0 };
             let y = up + 356.0 - (i % rows) as f64 * 19.0;
@@ -671,14 +673,19 @@ impl SettingsController {
         let license = self.centered(mtm, parent, 28.0, 15.0, "Open source under GNU GPL v3.0");
         license.setFont(Some(&NSFont::systemFontOfSize(11.0)));
         license.setTextColor(Some(&NSColor::tertiaryLabelColor()));
+
+        CH + up
     }
 
-    fn build_connection_pane(&self, mtm: MainThreadMarker, parent: &NSView) {
-        // ---- connection list ----
+    /// Returns the pane's preferred content height: the editor's tallest
+    /// (RDP, password) layout plus the button bar.
+    fn build_connection_pane(&self, mtm: MainThreadMarker, parent: &NSView) -> f64 {
+        // ---- connection list (grows with the window) ----
         let scroll = NSScrollView::initWithFrame(
             NSScrollView::alloc(mtm),
-            rect(16.0, 56.0, 190.0, CH - 64.0),
+            rect(16.0, BUTTON_BAR, 190.0, CH - BUTTON_BAR - 8.0),
         );
+        scroll.setAutoresizingMask(NSAutoresizingMaskOptions::ViewHeightSizable);
         scroll.setHasVerticalScroller(true);
         scroll.setBorderType(NSBorderType::BezelBorder);
         let table =
@@ -750,6 +757,9 @@ impl SettingsController {
             "No connection selected — click + to add one.",
         );
         empty.setAlignment(NSTextAlignment::Center);
+        empty.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewMinYMargin | NSAutoresizingMaskOptions::ViewMaxYMargin,
+        );
         self.muted(&empty);
         *self.ivars().empty_label.borrow_mut() = Some(empty);
 
@@ -985,14 +995,35 @@ impl SettingsController {
             }
         }
 
+        // Measure the tallest layout (RDP with password authentication);
+        // `update_visibility` sets the real row state afterwards.
+        for row in ssh.iter().chain(&entra_auth) {
+            row.setHidden(true);
+        }
+        let editor_height = GRID_TOP + grid.fittingSize().height + GRID_TOP;
+
+        // The editor scrolls only when the screen is too short for it; the
+        // list and the button bar stay in place.
+        let editor = NSScrollView::initWithFrame(
+            NSScrollView::alloc(mtm),
+            rect(FORM_X - 8.0, BUTTON_BAR, W - FORM_X + 8.0, CH - BUTTON_BAR),
+        );
+        editor.setAutoresizingMask(NSAutoresizingMaskOptions::ViewHeightSizable);
+        editor.setBorderType(NSBorderType::NoBorder);
+        editor.setHasVerticalScroller(true);
+        editor.setAutohidesScrollers(true);
+        editor.setDrawsBackground(false);
+        let document = FlippedView::new(mtm, rect(0.0, 0.0, W - FORM_X + 8.0, editor_height));
         grid.setTranslatesAutoresizingMaskIntoConstraints(false);
-        parent.addSubview(&grid);
+        document.addSubview(&grid);
         grid.topAnchor()
-            .constraintEqualToAnchor_constant(&parent.topAnchor(), GRID_TOP)
+            .constraintEqualToAnchor_constant(&document.topAnchor(), GRID_TOP)
             .setActive(true);
         grid.leadingAnchor()
-            .constraintEqualToAnchor_constant(&parent.leadingAnchor(), FORM_X)
+            .constraintEqualToAnchor_constant(&document.leadingAnchor(), 8.0)
             .setActive(true);
+        editor.setDocumentView(Some(&document));
+        parent.addSubview(&editor);
 
         let ivars = self.ivars();
         *ivars.name.borrow_mut() = Some(name);
@@ -1024,11 +1055,14 @@ impl SettingsController {
         *ivars.password_auth_group.borrow_mut() = password_auth;
         *ivars.entra_auth_group.borrow_mut() = entra_auth;
         *ivars.ssh_group.borrow_mut() = ssh;
+
+        BUTTON_BAR + editor_height
     }
 
     /// Laid out by an `NSGridView`: a right-aligned label column and a control
     /// column, rows aligned on their first baseline. No frame arithmetic.
-    fn build_global_pane(&self, mtm: MainThreadMarker, parent: &NSView) {
+    /// Returns the pane's preferred content height.
+    fn build_global_pane(&self, mtm: MainThreadMarker, parent: &NSView) -> f64 {
         let label = |text: &str| NSTextField::labelWithString(&NSString::from_str(text), mtm);
         let muted = |text: &str| {
             let l = label(text);
@@ -1173,6 +1207,8 @@ impl SettingsController {
         *self.ivars().mac_shortcuts.borrow_mut() = Some(mac_shortcuts);
         *self.ivars().external_stt_paste.borrow_mut() = Some(external_stt_paste);
         *self.ivars().launch_at_login.borrow_mut() = Some(login);
+
+        GRID_TOP + grid.fittingSize().height + GRID_TOP
     }
 
     // ---------- small control builders ----------
@@ -1263,6 +1299,35 @@ impl SettingsController {
 
     fn pane(&self) -> usize {
         self.ivars().pane.get()
+    }
+
+    /// Resize the window to the visible pane's preferred height, keeping the
+    /// top edge in place and never growing past the screen's usable height.
+    fn fit_window_to_pane(&self) {
+        let Some(window) = self.ivars().window.borrow().clone() else {
+            return;
+        };
+        let wanted = self.ivars().pane_heights.get()[self.pane()];
+        let frame = window.frame();
+        let content = window.contentRectForFrameRect(frame);
+        let chrome = frame.size.height - content.size.height;
+        let usable = window
+            .screen()
+            .or_else(|| NSScreen::mainScreen(self.mtm()))
+            .map(|screen| screen.visibleFrame().size.height - chrome)
+            .unwrap_or(wanted);
+        let height = wanted.min(usable);
+        if (content.size.height - height).abs() < 0.5 {
+            return;
+        }
+        let top = frame.origin.y + frame.size.height;
+        let resized = rect(
+            frame.origin.x,
+            top - height - chrome,
+            frame.size.width,
+            height + chrome,
+        );
+        window.setFrame_display_animate(resized, true, window.isVisible());
     }
 
     fn save_document(&self, document: &Document) -> bool {
@@ -1418,6 +1483,7 @@ impl SettingsController {
         if let Some(t) = self.ivars().toolbar.borrow().as_ref() {
             t.setSelectedItemIdentifier(Some(&NSString::from_str(id)));
         }
+        self.fit_window_to_pane();
         let has_selection = self.ivars().selected.get() >= 0;
         let is_ssh = self
             .ivars()
