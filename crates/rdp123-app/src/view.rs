@@ -8,8 +8,8 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSCursor, NSEvent, NSMenuItem, NSMenuItemValidation, NSPasteboard, NSPasteboardTypeString,
-    NSView,
+    NSApplication, NSCursor, NSEvent, NSEventType, NSMenuItem, NSMenuItemValidation, NSPasteboard,
+    NSPasteboardTypeString, NSView,
 };
 use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect};
 
@@ -80,7 +80,7 @@ define_class!(
 
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
-            self.forward_key_down(event.keyCode());
+            self.forward_key_down(event.keyCode(), key_character(event));
         }
 
         #[unsafe(method(keyUp:))]
@@ -226,7 +226,7 @@ define_class!(
                 events.push(InputEvent::Wheel { delta: vx, horizontal: true });
             }
             if !events.is_empty() {
-                self.send_with_deferred_modifiers(events);
+                self.send(events);
             }
         }
 
@@ -249,12 +249,16 @@ impl RdpView {
         self.ivars().external_stt_paste_enabled.set(enabled);
     }
 
-    pub fn forward_key_down(&self, keycode: u16) {
-        let (events, external_paste) = self
-            .ivars()
-            .input_routing
-            .borrow_mut()
-            .key_down(keycode, self.ivars().external_stt_paste_enabled.get());
+    pub fn set_mac_shortcuts_enabled(&self, enabled: bool) {
+        self.ivars().input_routing.borrow_mut().mac_shortcuts = enabled;
+    }
+
+    pub fn forward_key_down(&self, keycode: u16, character: Option<char>) {
+        let (events, external_paste) = self.ivars().input_routing.borrow_mut().key_down(
+            keycode,
+            character,
+            self.ivars().external_stt_paste_enabled.get(),
+        );
         self.send(events);
         if external_paste {
             self.submit_external_stt_paste();
@@ -270,12 +274,12 @@ impl RdpView {
         self.send(events);
     }
 
-    pub fn forward_key_pulse(&self, keycode: u16) {
-        let (events, external_paste) = self
-            .ivars()
-            .input_routing
-            .borrow_mut()
-            .key_pulse(keycode, self.ivars().external_stt_paste_enabled.get());
+    pub fn forward_key_pulse(&self, keycode: u16, character: Option<char>) {
+        let (events, external_paste) = self.ivars().input_routing.borrow_mut().key_pulse(
+            keycode,
+            character,
+            self.ivars().external_stt_paste_enabled.get(),
+        );
         self.send(events);
         if external_paste {
             self.submit_external_stt_paste();
@@ -291,9 +295,17 @@ impl RdpView {
             .any(|keycode| is_command_key(*keycode))
     }
 
+    /// A menu key equivalent forwards the key actually pressed, so the layout
+    /// decides the shortcut; a menu click falls back to the US key position.
     fn forward_menu_shortcut(&self, keycode: u16) {
-        if self.command_modifier_pressed() {
-            self.forward_key_pulse(keycode);
+        if !self.command_modifier_pressed() {
+            return;
+        }
+        match NSApplication::sharedApplication(self.mtm()).currentEvent() {
+            Some(event) if event.r#type() == NSEventType::KeyDown => {
+                self.forward_key_pulse(event.keyCode(), key_character(&event))
+            }
+            _ => self.forward_key_pulse(keycode, None),
         }
     }
 
@@ -408,9 +420,11 @@ impl RdpView {
         }
     }
 
+    /// Moves and scrolls leave a held ⌘ deferred: sending it would make a
+    /// following ⌘C release a lone Windows key and open Start.
     fn mouse_move(&self, event: &NSEvent) {
         if let Some((x, y)) = self.remote_point(event) {
-            self.send_with_deferred_modifiers(vec![InputEvent::MouseMove { x, y }]);
+            self.send(vec![InputEvent::MouseMove { x, y }]);
         }
     }
 
@@ -444,6 +458,10 @@ struct InputRoutingState {
     suppressed_command_modifiers: HashSet<u16>,
     suppressed_key_ups: HashSet<u16>,
     external_paste_active: bool,
+    /// Send ⌘C/X/V/A/Z/F/W as the Ctrl shortcut instead of the Windows key.
+    mac_shortcuts: bool,
+    /// ⌘ keys currently represented on the remote by one Ctrl key.
+    ctrl_command_modifiers: HashSet<u16>,
 }
 
 impl InputRoutingState {
@@ -466,7 +484,7 @@ impl InputRoutingState {
             return Vec::new();
         }
         if is_command_key(keycode) {
-            if down && external_stt_paste_enabled {
+            if down && (external_stt_paste_enabled || self.mac_shortcuts) {
                 self.deferred_command_modifiers.insert(keycode);
                 return Vec::new();
             }
@@ -476,6 +494,16 @@ impl InputRoutingState {
                         self.external_paste_active = false;
                     }
                     return Vec::new();
+                }
+                if self.ctrl_command_modifiers.remove(&keycode) {
+                    return if self.ctrl_command_modifiers.is_empty() {
+                        vec![InputEvent::Key {
+                            keycode: LEFT_CONTROL_KEYCODE,
+                            down: false,
+                        }]
+                    } else {
+                        Vec::new()
+                    };
                 }
                 if self.deferred_command_modifiers.remove(&keycode) {
                     return vec![
@@ -494,9 +522,12 @@ impl InputRoutingState {
         vec![InputEvent::Key { keycode, down }]
     }
 
+    /// `character` is the key's layout character ignoring modifiers other
+    /// than Shift, when known; it decides which keys are Mac shortcuts.
     fn key_down(
         &mut self,
         keycode: u16,
+        character: Option<char>,
         external_stt_paste_enabled: bool,
     ) -> (Vec<InputEvent>, bool) {
         if is_command_key(keycode) {
@@ -514,12 +545,87 @@ impl InputRoutingState {
         {
             return self.paste_invoked(true);
         }
-        let mut events = self.flush_deferred_command_modifiers();
+        let mut events = if self.translates_to_ctrl(keycode, character) {
+            self.command_as_ctrl()
+        } else {
+            let mut events = self.command_as_windows_key();
+            events.extend(self.flush_deferred_command_modifiers());
+            events
+        };
         events.push(InputEvent::Key {
             keycode,
             down: true,
         });
         (events, false)
+    }
+
+    /// ⌘ (alone or with ⇧) plus a Mac editing shortcut key.
+    fn translates_to_ctrl(&self, keycode: u16, character: Option<char>) -> bool {
+        self.mac_shortcuts
+            && self.active_command_keys().next().is_some()
+            && !self.pressed_modifiers.iter().any(|key| {
+                matches!(
+                    *key,
+                    LEFT_CONTROL_KEYCODE
+                        | RIGHT_CONTROL_KEYCODE
+                        | LEFT_OPTION_KEYCODE
+                        | RIGHT_OPTION_KEYCODE
+                )
+            })
+            && is_mac_shortcut(keycode, character)
+    }
+
+    /// Held ⌘ keys that are not swallowed by an external STT paste.
+    fn active_command_keys(&self) -> impl Iterator<Item = u16> + '_ {
+        self.pressed_modifiers
+            .iter()
+            .copied()
+            .filter(|key| is_command_key(*key) && !self.suppressed_command_modifiers.contains(key))
+    }
+
+    /// Represent every held ⌘ as Ctrl on the remote.
+    fn command_as_ctrl(&mut self) -> Vec<InputEvent> {
+        let mut keycodes: Vec<_> = self
+            .active_command_keys()
+            .filter(|key| !self.ctrl_command_modifiers.contains(key))
+            .collect();
+        keycodes.sort_unstable();
+        let mut events = Vec::new();
+        for &keycode in &keycodes {
+            // Not deferred means the Windows key is already down remotely.
+            if !self.deferred_command_modifiers.remove(&keycode) {
+                events.push(InputEvent::Key {
+                    keycode,
+                    down: false,
+                });
+            }
+        }
+        if self.ctrl_command_modifiers.is_empty() && !keycodes.is_empty() {
+            events.push(InputEvent::Key {
+                keycode: LEFT_CONTROL_KEYCODE,
+                down: true,
+            });
+        }
+        self.ctrl_command_modifiers.extend(keycodes);
+        events
+    }
+
+    /// Undo `command_as_ctrl`: release Ctrl and press the held ⌘ keys again.
+    fn command_as_windows_key(&mut self) -> Vec<InputEvent> {
+        if self.ctrl_command_modifiers.is_empty() {
+            return Vec::new();
+        }
+        let mut keycodes: Vec<_> = self.ctrl_command_modifiers.drain().collect();
+        keycodes.sort_unstable();
+        let mut events = vec![InputEvent::Key {
+            keycode: LEFT_CONTROL_KEYCODE,
+            down: false,
+        }];
+        events.extend(keycodes.into_iter().map(|keycode| InputEvent::Key {
+            keycode,
+            down: true,
+        }));
+        events
     }
 
     fn key_up(&mut self, keycode: u16, external_stt_paste_enabled: bool) -> Vec<InputEvent> {
@@ -541,9 +647,11 @@ impl InputRoutingState {
     fn key_pulse(
         &mut self,
         keycode: u16,
+        character: Option<char>,
         external_stt_paste_enabled: bool,
     ) -> (Vec<InputEvent>, bool) {
-        let (mut events, external_paste) = self.key_down(keycode, external_stt_paste_enabled);
+        let (mut events, external_paste) =
+            self.key_down(keycode, character, external_stt_paste_enabled);
         events.extend(self.key_up(keycode, external_stt_paste_enabled));
         (events, external_paste)
     }
@@ -570,6 +678,14 @@ impl InputRoutingState {
         for keycode in command_keys {
             if self.deferred_command_modifiers.remove(&keycode) {
                 self.suppressed_command_modifiers.insert(keycode);
+            } else if self.ctrl_command_modifiers.remove(&keycode) {
+                self.suppressed_command_modifiers.insert(keycode);
+                if self.ctrl_command_modifiers.is_empty() {
+                    events.push(InputEvent::Key {
+                        keycode: LEFT_CONTROL_KEYCODE,
+                        down: false,
+                    });
+                }
             } else if !self.suppressed_command_modifiers.contains(&keycode) {
                 // The setting may have been enabled while Command was already
                 // held. Release that forwarded modifier immediately.
@@ -601,19 +717,44 @@ impl InputRoutingState {
         self.suppressed_command_modifiers.clear();
         self.suppressed_key_ups.clear();
         self.external_paste_active = false;
+        self.ctrl_command_modifiers.clear();
     }
 }
 
 const LEFT_COMMAND_KEYCODE: u16 = 0x37;
 const RIGHT_COMMAND_KEYCODE: u16 = 0x36;
+const LEFT_CONTROL_KEYCODE: u16 = 0x3b;
+const RIGHT_CONTROL_KEYCODE: u16 = 0x3e;
+const LEFT_OPTION_KEYCODE: u16 = 0x3a;
+const RIGHT_OPTION_KEYCODE: u16 = 0x3d;
 const A_KEYCODE: u16 = 0x00;
 const C_KEYCODE: u16 = 0x08;
+const F_KEYCODE: u16 = 0x03;
 const V_KEYCODE: u16 = 0x09;
+const W_KEYCODE: u16 = 0x0d;
 const X_KEYCODE: u16 = 0x07;
 const Z_KEYCODE: u16 = 0x06;
 
 fn is_command_key(keycode: u16) -> bool {
     matches!(keycode, LEFT_COMMAND_KEYCODE | RIGHT_COMMAND_KEYCODE)
+}
+
+/// The shortcuts Windows App translates: copy, cut, paste, select all, undo,
+/// find, close. Non-Latin layouts fall back to the US key position, as macOS
+/// does for ⌘ shortcuts.
+fn is_mac_shortcut(keycode: u16, character: Option<char>) -> bool {
+    match character {
+        Some(c) if c.is_ascii() => {
+            matches!(
+                c.to_ascii_lowercase(),
+                'a' | 'c' | 'f' | 'v' | 'w' | 'x' | 'z'
+            )
+        }
+        _ => matches!(
+            keycode,
+            A_KEYCODE | C_KEYCODE | F_KEYCODE | V_KEYCODE | W_KEYCODE | X_KEYCODE | Z_KEYCODE
+        ),
+    }
 }
 
 fn modifier_masks(keycode: u16) -> Option<(usize, usize)> {
@@ -629,6 +770,15 @@ fn modifier_masks(keycode: u16) -> Option<(usize, usize)> {
         0x3e => (0x0000_2000, 0x0004_0000), // right control
         _ => return None,
     })
+}
+
+/// The key's layout character, ignoring modifiers other than Shift.
+pub fn key_character(event: &NSEvent) -> Option<char> {
+    event
+        .charactersIgnoringModifiers()?
+        .to_string()
+        .chars()
+        .next()
 }
 
 fn external_stt_paste_text(enabled: bool, text: Option<&str>) -> Option<String> {
@@ -687,7 +837,7 @@ mod tests {
     #[test]
     fn stt_runtime_regression_synthetic_command_key_events_never_reach_windows() {
         let mut routing = InputRoutingState::default();
-        let (mut remote_events, _) = routing.key_down(0x37, true);
+        let (mut remote_events, _) = routing.key_down(0x37, None, true);
         let (paste_events, submit) = routing.paste_invoked(true);
         remote_events.extend(paste_events);
         remote_events.extend(routing.key_up(0x09, true));
@@ -705,7 +855,7 @@ mod tests {
         let mut routing = InputRoutingState::default();
         assert!(routing.modifier_changed(0x37, true, true).is_empty());
 
-        let (events, external_paste) = routing.key_down(0x08, true);
+        let (events, external_paste) = routing.key_down(0x08, None, true);
 
         assert!(!external_paste);
         assert!(matches!(
@@ -735,7 +885,7 @@ mod tests {
         let mut routing = InputRoutingState::default();
         assert!(routing.modifier_changed(0x37, true, true).is_empty());
 
-        let (events, external_paste) = routing.key_pulse(0x0f, true);
+        let (events, external_paste) = routing.key_pulse(0x0f, None, true);
 
         assert!(!external_paste);
         assert!(matches!(
@@ -804,12 +954,137 @@ mod tests {
         ));
     }
 
+    fn key(keycode: u16, down: bool) -> InputEvent {
+        InputEvent::Key { keycode, down }
+    }
+
+    fn mac_shortcut_routing() -> InputRoutingState {
+        InputRoutingState {
+            mac_shortcuts: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn mac_shortcut_sends_ctrl_instead_of_the_windows_key() {
+        let mut routing = mac_shortcut_routing();
+        assert!(routing.modifier_changed(0x37, true, false).is_empty());
+
+        let (events, _) = routing.key_pulse(0x08, Some('c'), false);
+        assert_eq!(events, [key(0x3b, true), key(0x08, true), key(0x08, false)]);
+        assert_eq!(
+            routing.modifier_changed(0x37, false, false),
+            [key(0x3b, false)]
+        );
+    }
+
+    #[test]
+    fn mac_shortcut_follows_the_layout_character_not_the_key_position() {
+        // Swiss German QWERTZ: Z sits on the US Y key and Y on the US Z key.
+        let mut routing = mac_shortcut_routing();
+        routing.modifier_changed(0x37, true, false);
+        let (undo, _) = routing.key_pulse(0x10, Some('z'), false);
+        assert_eq!(undo, [key(0x3b, true), key(0x10, true), key(0x10, false)]);
+        routing.modifier_changed(0x37, false, false);
+
+        routing.modifier_changed(0x37, true, false);
+        let (win_y, _) = routing.key_pulse(0x06, Some('y'), false);
+        assert_eq!(win_y, [key(0x37, true), key(0x06, true), key(0x06, false)]);
+        assert_eq!(
+            routing.modifier_changed(0x37, false, false),
+            [key(0x37, false)]
+        );
+    }
+
+    #[test]
+    fn mac_shortcut_falls_back_to_key_position_for_non_latin_layouts() {
+        let mut routing = mac_shortcut_routing();
+        routing.modifier_changed(0x37, true, false);
+        let (events, _) = routing.key_pulse(0x08, Some('с'), false); // Cyrillic es
+        assert_eq!(events, [key(0x3b, true), key(0x08, true), key(0x08, false)]);
+    }
+
+    #[test]
+    fn mac_shortcut_keeps_command_tap_as_windows_key() {
+        let mut routing = mac_shortcut_routing();
+        assert!(routing.modifier_changed(0x37, true, false).is_empty());
+        assert_eq!(
+            routing.modifier_changed(0x37, false, false),
+            [key(0x37, true), key(0x37, false)]
+        );
+    }
+
+    #[test]
+    fn mac_shortcut_switches_back_to_windows_key_for_other_keys() {
+        let mut routing = mac_shortcut_routing();
+        routing.modifier_changed(0x37, true, false);
+        routing.key_pulse(0x08, Some('c'), false);
+
+        let (events, _) = routing.key_pulse(0x0e, Some('e'), false);
+        assert_eq!(
+            events,
+            [
+                key(0x3b, false),
+                key(0x37, true),
+                key(0x0e, true),
+                key(0x0e, false)
+            ]
+        );
+        let (events, _) = routing.key_pulse(0x09, Some('v'), false);
+        assert_eq!(
+            events,
+            [
+                key(0x37, false),
+                key(0x3b, true),
+                key(0x09, true),
+                key(0x09, false)
+            ]
+        );
+        assert_eq!(
+            routing.modifier_changed(0x37, false, false),
+            [key(0x3b, false)]
+        );
+    }
+
+    #[test]
+    fn mac_shortcut_allows_shift() {
+        let mut routing = mac_shortcut_routing();
+        routing.modifier_changed(0x38, true, false);
+        routing.modifier_changed(0x37, true, false);
+        let (events, _) = routing.key_pulse(0x06, Some('Z'), false);
+        assert_eq!(events, [key(0x3b, true), key(0x06, true), key(0x06, false)]);
+    }
+
+    #[test]
+    fn mac_shortcut_is_not_applied_with_option_or_control() {
+        for other in [0x3a, 0x3b] {
+            let mut routing = mac_shortcut_routing();
+            routing.modifier_changed(other, true, false);
+            routing.modifier_changed(0x37, true, false);
+            let (events, _) = routing.key_pulse(0x08, Some('c'), false);
+            assert_eq!(events, [key(0x37, true), key(0x08, true), key(0x08, false)]);
+        }
+    }
+
+    #[test]
+    fn external_stt_paste_releases_a_translated_ctrl() {
+        let mut routing = mac_shortcut_routing();
+        routing.modifier_changed(0x37, true, true);
+        routing.key_pulse(0x08, Some('c'), true);
+
+        let (events, submit) = routing.key_down(0x09, Some('v'), true);
+        assert!(submit);
+        assert_eq!(events, [key(0x3b, false)]);
+        assert!(routing.key_up(0x09, true).is_empty());
+        assert!(routing.modifier_changed(0x37, false, true).is_empty());
+    }
+
     #[test]
     fn duplicate_key_and_menu_paste_dispatch_submits_only_once() {
         let mut routing = InputRoutingState::default();
         routing.modifier_changed(0x37, true, true);
 
-        let (_, key_dispatch_submits) = routing.key_down(0x09, true);
+        let (_, key_dispatch_submits) = routing.key_down(0x09, None, true);
         let (_, menu_dispatch_submits) = routing.paste_invoked(true);
 
         assert!(key_dispatch_submits);

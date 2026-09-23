@@ -82,11 +82,11 @@ define_class!(
                 if let Some(view) = view {
                     match session_key_down_action(keycode, event.modifierFlags().0) {
                         SessionKeyDownAction::Forward => {
-                            view.forward_key_down(keycode);
+                            view.forward_key_down(keycode, crate::view::key_character(event));
                             return;
                         }
                         SessionKeyDownAction::Pulse => {
-                            view.forward_key_pulse(keycode);
+                            view.forward_key_pulse(keycode, crate::view::key_character(event));
                             return;
                         }
                         SessionKeyDownAction::AppKit => {}
@@ -442,6 +442,12 @@ impl WindowController {
             view.set_external_stt_paste_enabled(
                 enabled && self.ivars().clipboard_mode.get().allow_local_to_remote(),
             );
+        }
+    }
+
+    pub fn set_mac_shortcuts_enabled(&self, enabled: bool) {
+        if let Some(view) = self.ivars().view.borrow().as_ref() {
+            view.set_mac_shortcuts_enabled(enabled);
         }
     }
 

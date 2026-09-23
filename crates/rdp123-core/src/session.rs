@@ -831,7 +831,7 @@ fn apply_remote_file_contents(
 }
 
 /// A logical mouse button.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PointerButton {
     Left,
     Right,
@@ -839,7 +839,7 @@ pub enum PointerButton {
 }
 
 /// UI-originated input, already translated into remote pixel coordinates.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputEvent {
     Key {
         keycode: u16,

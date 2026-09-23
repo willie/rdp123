@@ -105,6 +105,17 @@ pub fn set_external_stt_paste_enabled(enabled: bool) {
     });
 }
 
+/// Apply the global Mac shortcuts preference to every open RDP window.
+pub fn set_mac_shortcuts_enabled(enabled: bool) {
+    DELEGATE.with(|d| {
+        if let Some(delegate) = d.borrow().as_ref() {
+            for controller in delegate.ivars().borrow().windows.values() {
+                controller.set_mac_shortcuts_enabled(enabled);
+            }
+        }
+    });
+}
+
 pub struct AppState {
     store: ProfileStore,
     /// Snapshot backing the current menu; menu tags index into this.
@@ -451,6 +462,7 @@ impl AppDelegate {
             &connection.rdp,
             global_settings.external_stt_paste,
         );
+        controller.set_mac_shortcuts_enabled(global_settings.mac_shortcuts);
 
         let (width, height, scale) = controller.initial_size();
         let opts = &connection.rdp;
