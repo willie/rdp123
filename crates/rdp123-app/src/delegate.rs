@@ -13,7 +13,8 @@ use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSControlStateValueOn,
-    NSMenu, NSMenuDelegate, NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+    NSEventModifierFlags, NSMenu, NSMenuDelegate, NSMenuItem, NSStatusBar, NSStatusItem,
+    NSVariableStatusItemLength,
 };
 use objc2_foundation::{ns_string, NSNotification, NSObject, NSObjectProtocol, NSString};
 
@@ -689,14 +690,36 @@ fn install_main_menu(mtm: MainThreadMarker) {
 
     let main_menu = NSMenu::new(mtm);
 
-    // App menu (first slot): Settings… with ⌘, and Quit with ⌘Q.
+    // App menu (first slot), in the HIG's standard order. Session views
+    // answer `hide:`/`hideOtherApplications:` themselves and send the keys
+    // to the remote, as they do for ⌘W.
     let app_slot = NSMenuItem::new(mtm);
     let app_menu = NSMenu::new(mtm);
+    app_menu.addItem(&item(
+        mtm,
+        "About RDP123",
+        sel!(orderFrontStandardAboutPanel:),
+        "",
+    ));
+    app_menu.addItem(&NSMenuItem::separatorItem(mtm));
     app_menu.addItem(&item(mtm, "Settings…", sel!(openSettings:), ","));
+    app_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    let services_slot = item(mtm, "Services", sel!(submenuAction:), "");
+    let services_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Services"));
+    services_slot.setSubmenu(Some(&services_menu));
+    app_menu.addItem(&services_slot);
+    app_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    app_menu.addItem(&item(mtm, "Hide RDP123", sel!(hide:), "h"));
+    let hide_others = item(mtm, "Hide Others", sel!(hideOtherApplications:), "h");
+    hide_others
+        .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
+    app_menu.addItem(&hide_others);
+    app_menu.addItem(&item(mtm, "Show All", sel!(unhideAllApplications:), ""));
     app_menu.addItem(&NSMenuItem::separatorItem(mtm));
     app_menu.addItem(&item(mtm, "Quit RDP123", sel!(terminate:), "q"));
     app_slot.setSubmenu(Some(&app_menu));
     main_menu.addItem(&app_slot);
+    NSApplication::sharedApplication(mtm).setServicesMenu(Some(&services_menu));
 
     // File menu: Close ⌘W for the Settings window. Session windows answer
     // `performClose:` themselves and send ⌘W to the remote instead.
