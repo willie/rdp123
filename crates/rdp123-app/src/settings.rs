@@ -863,7 +863,17 @@ impl SettingsController {
         let res_mode = popup(&["Fit to window", "Fixed"], sel!(resModeChanged:), 160.0);
         let res_w = text("1920", 70.0);
         let res_h = text("1080", 70.0);
-        let fixed_size = dependent(&[view(&res_w), view(&label("×")), view(&res_h)]);
+        // The size belongs to the "Fixed" choice, so it sits on the same row
+        // (and is disabled for "Fit to window").
+        let resolution = NSStackView::stackViewWithViews(
+            &NSArray::from_retained_slice(&[
+                view(&res_mode),
+                view(&res_w),
+                view(&label("×")),
+                view(&res_h),
+            ]),
+            mtm,
+        );
         let scaling = popup(&["Auto", "100%", "140%", "180%", "200%"], dirty, 120.0);
         let color = popup(&["High (32-bit)", "Medium (16-bit)"], dirty, 180.0);
         let graphics = popup(
@@ -936,8 +946,7 @@ impl SettingsController {
                 EntraAuth,
             ),
             heading("Display", Rdp),
-            field("Resolution:", &res_mode, Rdp),
-            control(&fixed_size, Rdp),
+            field("Resolution:", &resolution, Rdp),
             field("Scaling:", &scaling, Rdp),
             field("Color quality:", &color, Rdp),
             field("Graphics:", &graphics, Rdp),
