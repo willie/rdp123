@@ -24,11 +24,11 @@ use objc2_app_kit::{
     NSControlTextEditingDelegate, NSFont, NSGridCell, NSGridCellPlacement, NSGridRow,
     NSGridRowAlignment, NSGridView, NSImage, NSImageName, NSImageNameAddTemplate,
     NSImageNameRemoveTemplate, NSImageView, NSLineBreakMode, NSPasteboard, NSPasteboardTypeString,
-    NSPopUpButton, NSScreen, NSScrollView, NSSecureTextField, NSStackView, NSTableColumn,
-    NSTableView, NSTableViewColumnAutoresizingStyle, NSTableViewDataSource, NSTableViewDelegate,
-    NSTableViewStyle, NSTextAlignment, NSTextField, NSTextFieldDelegate, NSToolbar,
-    NSToolbarDelegate, NSToolbarDisplayMode, NSToolbarItem, NSView, NSWindow, NSWindowDelegate,
-    NSWindowStyleMask, NSWindowToolbarStyle, NSWorkspace,
+    NSPopUpButton, NSScreen, NSScrollView, NSSecureTextField, NSStackView, NSStackViewDistribution,
+    NSTableColumn, NSTableView, NSTableViewColumnAutoresizingStyle, NSTableViewDataSource,
+    NSTableViewDelegate, NSTableViewStyle, NSTextAlignment, NSTextField, NSTextFieldDelegate,
+    NSToolbar, NSToolbarDelegate, NSToolbarDisplayMode, NSToolbarItem, NSView, NSWindow,
+    NSWindowDelegate, NSWindowStyleMask, NSWindowToolbarStyle, NSWorkspace,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{
@@ -77,7 +77,11 @@ const W: f64 = 720.0;
 const CH: f64 = 716.0;
 /// Strip along the bottom of the Connections pane for +/− and Revert/Save.
 const BUTTON_BAR: f64 = 56.0;
-const GRID_TOP: f64 = 20.0; // space above the first grid row
+/// Frame of the Revert/Save row; the +/− buttons are centered on it.
+const BOTTOM_ROW_Y: f64 = 16.0;
+const BOTTOM_ROW_H: f64 = 30.0;
+/// Space between the window edge and its content, on every side.
+const MARGIN: f64 = 16.0;
 const INDENT: f64 = 20.0; // leading indent of a control that depends on the row above
 const FORM_X: f64 = 224.0;
 const LABEL_W: f64 = 150.0;
@@ -688,20 +692,21 @@ impl SettingsController {
         let header = self.label(
             mtm,
             parent,
-            rect(16.0, CH - GRID_TOP - 17.0, 190.0, 17.0),
+            rect(MARGIN, CH - MARGIN - 17.0, 190.0, 17.0),
             "Connections",
         );
         header.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
         header.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinYMargin);
 
-        // Add/remove buttons sit on the list's bottom edge, and the list's
-        // border overlaps their top edge by a point so they read as one unit.
-        let (buttons_y, button_w, button_h) = (24.0, 24.0, 22.0);
-        let list_bottom = buttons_y + button_h - 1.0;
-        let list_top = CH - GRID_TOP - 17.0 - 6.0;
+        // Add/remove buttons share the bottom row's center line with
+        // Revert/Save, and leave room above them for the list's focus ring.
+        let (button_w, button_h) = (24.0, 22.0);
+        let buttons_y = BOTTOM_ROW_Y + (BOTTOM_ROW_H - button_h) / 2.0;
+        let list_bottom = buttons_y + button_h + 8.0;
+        let list_top = CH - MARGIN - 17.0 - 6.0;
         let scroll = NSScrollView::initWithFrame(
             NSScrollView::alloc(mtm),
-            rect(16.0, list_bottom, 190.0, list_top - list_bottom),
+            rect(MARGIN, list_bottom, 190.0, list_top - list_bottom),
         );
         scroll.setAutoresizingMask(NSAutoresizingMaskOptions::ViewHeightSizable);
         scroll.setHasVerticalScroller(true);
@@ -748,13 +753,13 @@ impl SettingsController {
         };
         let add = list_button(
             unsafe { NSImageNameAddTemplate },
-            16.0,
+            MARGIN,
             sel!(addConnection:),
         );
         add.setToolTip(Some(&NSString::from_str("Add a connection")));
         let remove = list_button(
             unsafe { NSImageNameRemoveTemplate },
-            16.0 + button_w - 1.0,
+            MARGIN + button_w - 1.0,
             sel!(removeConnection:),
         );
         remove.setToolTip(Some(&NSString::from_str("Remove the selected connection")));
@@ -764,7 +769,7 @@ impl SettingsController {
         let save = self.button_ret(
             mtm,
             parent,
-            rect(596.0, 16.0, 108.0, 30.0),
+            rect(W - MARGIN - 108.0, BOTTOM_ROW_Y, 108.0, BOTTOM_ROW_H),
             "Save",
             sel!(saveConnection:),
         );
@@ -773,7 +778,12 @@ impl SettingsController {
         let revert = self.button_ret(
             mtm,
             parent,
-            rect(480.0, 16.0, 108.0, 30.0),
+            rect(
+                W - MARGIN - 2.0 * 108.0 - 8.0,
+                BOTTOM_ROW_Y,
+                108.0,
+                BOTTOM_ROW_H,
+            ),
             "Revert",
             sel!(revertConnection:),
         );
@@ -825,7 +835,7 @@ impl SettingsController {
                 .setActive(true);
             t
         };
-        let popup = |items: &[&str], action: Sel, width: f64| {
+        let flexible_popup = |items: &[&str], action: Sel| {
             let p = NSPopUpButton::initWithFrame_pullsDown(
                 NSPopUpButton::alloc(mtm),
                 CGRect::ZERO,
@@ -838,6 +848,10 @@ impl SettingsController {
                 p.setTarget(Some(self.any()));
                 p.setAction(Some(action));
             }
+            p
+        };
+        let popup = |items: &[&str], action: Sel, width: f64| {
+            let p = flexible_popup(items, action);
             p.widthAnchor()
                 .constraintEqualToConstant(width)
                 .setActive(true);
@@ -895,11 +909,12 @@ impl SettingsController {
             .constraintEqualToConstant(FIELD_W)
             .setActive(true);
         let pw_policy = popup(&["Remember (Keychain)", "Always ask"], dirty, 210.0);
-        let res_mode = popup(&["Fit to window", "Fixed"], sel!(resModeChanged:), 160.0);
+        let res_mode = flexible_popup(&["Fit to window", "Fixed"], sel!(resModeChanged:));
         let res_w = text("1920", 70.0);
         let res_h = text("1080", 70.0);
         // The size belongs to the "Fixed" choice, so it sits on the same row
-        // (and is disabled for "Fit to window").
+        // (and is disabled for "Fit to window"). The row is exactly as wide
+        // as the other fields; the pop-up takes what the size fields leave.
         let resolution = NSStackView::stackViewWithViews(
             &NSArray::from_retained_slice(&[
                 view(&res_mode),
@@ -909,6 +924,11 @@ impl SettingsController {
             ]),
             mtm,
         );
+        resolution.setDistribution(NSStackViewDistribution::Fill);
+        resolution
+            .widthAnchor()
+            .constraintEqualToConstant(FIELD_W)
+            .setActive(true);
         let scaling = popup(&["Auto", "100%", "140%", "180%", "200%"], dirty, 120.0);
         let color = popup(&["High (32-bit)", "Medium (16-bit)"], dirty, 180.0);
         let graphics = popup(
@@ -1044,7 +1064,7 @@ impl SettingsController {
         for row in ssh.iter().chain(&entra_auth) {
             row.setHidden(true);
         }
-        let editor_height = GRID_TOP + grid.fittingSize().height + GRID_TOP;
+        let editor_height = MARGIN + grid.fittingSize().height + MARGIN;
 
         // The editor scrolls only when the screen is too short for it; the
         // list and the button bar stay in place.
@@ -1061,10 +1081,13 @@ impl SettingsController {
         grid.setTranslatesAutoresizingMaskIntoConstraints(false);
         document.addSubview(&grid);
         grid.topAnchor()
-            .constraintEqualToAnchor_constant(&document.topAnchor(), GRID_TOP)
+            .constraintEqualToAnchor_constant(&document.topAnchor(), MARGIN)
             .setActive(true);
+        // Place the grid so the field column ends at the window's right
+        // margin, using the grid's actual column spacing.
+        let grid_x = W - MARGIN - FIELD_W - grid.columnSpacing() - LABEL_W;
         grid.leadingAnchor()
-            .constraintEqualToAnchor_constant(&document.leadingAnchor(), 8.0)
+            .constraintEqualToAnchor_constant(&document.leadingAnchor(), grid_x - (FORM_X - 8.0))
             .setActive(true);
         editor.setDocumentView(Some(&document));
         parent.addSubview(&editor);
@@ -1239,10 +1262,10 @@ impl SettingsController {
         grid.setTranslatesAutoresizingMaskIntoConstraints(false);
         parent.addSubview(&grid);
         grid.topAnchor()
-            .constraintEqualToAnchor_constant(&parent.topAnchor(), GRID_TOP)
+            .constraintEqualToAnchor_constant(&parent.topAnchor(), MARGIN)
             .setActive(true);
         grid.leadingAnchor()
-            .constraintEqualToAnchor_constant(&parent.leadingAnchor(), 32.0)
+            .constraintEqualToAnchor_constant(&parent.leadingAnchor(), MARGIN)
             .setActive(true);
 
         *self.ivars().terminal.borrow_mut() = Some(term);
@@ -1252,7 +1275,7 @@ impl SettingsController {
         *self.ivars().external_stt_paste.borrow_mut() = Some(external_stt_paste);
         *self.ivars().launch_at_login.borrow_mut() = Some(login);
 
-        GRID_TOP + grid.fittingSize().height + GRID_TOP
+        MARGIN + grid.fittingSize().height + MARGIN
     }
 
     // ---------- small control builders ----------
