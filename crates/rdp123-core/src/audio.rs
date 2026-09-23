@@ -457,10 +457,9 @@ mod tests {
         assert_eq!(formats[0].n_samples_per_sec, 44_100);
     }
 
-    #[test]
-    fn training_confirm_echoes_the_server_pack_size() {
-        // GNOME Remote Desktop (FreeRDP server): wPackSize 1024 followed by
-        // 1024 bytes, and it ignores a confirm that does not echo 1024.
+    /// Feed a Training PDU carrying `data_len` bytes and wPackSize 1024
+    /// through the dynamic channel; return the confirm's wPackSize.
+    fn confirmed_pack_size(data_len: u16) -> u16 {
         let (tx, _rx) = sync_channel(1);
         let mut channel = RdpsndDvcChannel::new(RdpsndBackend {
             formats: Vec::new(),
@@ -470,10 +469,10 @@ mod tests {
         });
         channel.state = DvcAudioState::WaitingForTraining;
         let mut training = vec![0x06, 0x00]; // SNDC_TRAINING, bPad
-        training.extend_from_slice(&(4u16 + 1024).to_le_bytes()); // BodySize
+        training.extend_from_slice(&(4 + data_len).to_le_bytes()); // BodySize
         training.extend_from_slice(&0u16.to_le_bytes()); // wTimeStamp
         training.extend_from_slice(&1024u16.to_le_bytes()); // wPackSize
-        training.extend_from_slice(&[0; 1024]);
+        training.extend(std::iter::repeat_n(0, usize::from(data_len)));
 
         let replies = channel.process(5, &training).unwrap();
 
@@ -482,7 +481,17 @@ mod tests {
         let ClientAudioOutputPdu::TrainingConfirm(confirm) = reply else {
             panic!("expected a training confirm, got {reply:?}");
         };
-        assert_eq!(confirm.pack_size, 1024);
+        confirm.pack_size
+    }
+
+    #[test]
+    fn training_confirm_echoes_the_server_pack_size() {
+        // GNOME Remote Desktop (FreeRDP server) sends 1024 data bytes and
+        // ignores a confirm that does not echo 1024.
+        assert_eq!(confirmed_pack_size(1024), 1024);
+        // MS-RDPEA 2.2.3.1 (Windows): wPackSize counts the whole PDU, so
+        // 1024 covers the 8 header bytes plus 1016 data bytes.
+        assert_eq!(confirmed_pack_size(1016), 1024);
     }
 
     fn s16(v: f32) -> [u8; 2] {
