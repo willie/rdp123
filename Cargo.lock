@@ -1337,6 +1337,7 @@ dependencies = [
  "ironrdp-pdu",
  "openh264",
  "tracing",
+ "yuv",
 ]
 
 [[package]]

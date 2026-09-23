@@ -126,4 +126,6 @@ ironrdp-graphics = { path = "vendor/ironrdp-graphics" }
 # built on FreeRDP's server library, such as GNOME Remote Desktop:
 # - Annex B input is decoded as sent instead of being misread as
 #   length-prefixed NAL units (same detection as upstream PR #1986, open).
+# - YUV is converted as full-range BT.709 instead of limited-range BT.601
+#   (backport of upstream 9542e017, #1923, unreleased as of 0.3.0).
 ironrdp-egfx = { path = "vendor/ironrdp-egfx" }

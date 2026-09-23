@@ -44,7 +44,7 @@ arbitrary = [
     "bitflags/arbitrary",
     "ironrdp-pdu/arbitrary",
 ]
-openh264 = ["dep:openh264"]
+openh264 = ["dep:openh264", "dep:yuv"]
 openh264-bundled = [
     "openh264",
     "openh264/source",
@@ -90,6 +90,11 @@ default-features = false
 [dependencies.tracing]
 version = "0.1"
 features = ["log"]
+
+[dependencies.yuv]
+version = "0.8"
+optional = true
+default-features = false
 
 [lints.clippy]
 alloc_instead_of_core = "warn"
