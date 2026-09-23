@@ -134,6 +134,8 @@ pub struct GfxHandler {
     planar_regions: u64,
     /// Codec names already reported as unhandled (warn once per codec).
     warned_unhandled: HashSet<String>,
+    /// Codecs already reported as decoded by `ironrdp-egfx` (log once each).
+    decoded_codecs: Vec<Codec1Type>,
     warned_progressive: bool,
     /// RemoteFX Progressive frames decoded OK vs. failed. Logged (first
     /// success, first failure, then periodic totals) so a live capture shows
@@ -192,6 +194,7 @@ impl GfxHandler {
             clearcodec_failures: 0,
             planar_regions: 0,
             warned_unhandled: HashSet::new(),
+            decoded_codecs: Vec::new(),
             warned_progressive: false,
             progressive_frames: 0,
             progressive_failures: 0,
@@ -696,6 +699,10 @@ impl GraphicsPipelineHandler for GfxHandler {
         // Empty data means the codec was skipped (e.g. no decoder).
         if update.data.is_empty() {
             return;
+        }
+        if !self.decoded_codecs.contains(&update.codec_id) {
+            self.decoded_codecs.push(update.codec_id);
+            tracing::info!("egfx: {:?} regions active", update.codec_id);
         }
         if self.capture.is_some() {
             // Record 0x0B: surface u16, rect u16 x4, data_w u16, data_h u16,
