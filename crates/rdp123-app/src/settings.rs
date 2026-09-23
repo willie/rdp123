@@ -99,6 +99,17 @@ fn pane_identifiers() -> Retained<NSArray<NSString>> {
     NSArray::from_retained_slice(&PANES.map(|(id, ..)| NSString::from_str(id)))
 }
 
+/// The window frame that shows `wanted` points of content below `chrome`
+/// (title bar and toolbar): the top edge stays put and the height is capped
+/// at the screen's usable area. If growing would push the bottom (and the
+/// Save/Revert row) below that area, the window moves up instead.
+fn fitted_frame(frame: CGRect, chrome: f64, wanted: f64, visible: CGRect) -> CGRect {
+    let height = wanted.min(visible.size.height - chrome) + chrome;
+    let top = frame.origin.y + frame.size.height;
+    let y = (top - height).max(visible.origin.y);
+    rect(frame.origin.x, y, frame.size.width, height)
+}
+
 fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
     CGRect::new(CGPoint::new(x, y), CGSize::new(w, h))
 }
@@ -516,9 +527,9 @@ impl SettingsController {
     }
 
     fn build(&self, mtm: MainThreadMarker) {
-        // Fixed size: the connection list and the About pane are laid out
-        // with frame math for this content size. No minimize button: ⌘,
-        // reopens settings, so there is no reason to keep it in the Dock.
+        // Not user-resizable: the window fits each pane (`fit_window_to_pane`).
+        // No minimize button: ⌘, reopens settings, so there is no reason to
+        // keep it in the Dock.
         let style = NSWindowStyleMask::Titled | NSWindowStyleMask::Closable;
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -561,7 +572,26 @@ impl SettingsController {
         let about = pane_view();
         let conn_height = self.build_connection_pane(mtm, &conn);
         let global_height = self.build_global_pane(mtm, &global);
-        let about_height = self.build_about_pane(mtm, &about);
+
+        // About keeps its frame layout, inside a flipped document so it
+        // shows from the top and scrolls when the screen is too short.
+        let about_content = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, W, CH));
+        let about_height = self.build_about_pane(mtm, &about_content);
+        about_content.setFrameSize(CGSize::new(W, about_height));
+        let about_document = FlippedView::new(mtm, rect(0.0, 0.0, W, about_height));
+        about_document.addSubview(&about_content);
+        let about_scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), about.bounds());
+        about_scroll.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable
+                | NSAutoresizingMaskOptions::ViewHeightSizable,
+        );
+        about_scroll.setBorderType(NSBorderType::NoBorder);
+        about_scroll.setHasVerticalScroller(true);
+        about_scroll.setAutohidesScrollers(true);
+        about_scroll.setDrawsBackground(false);
+        about_scroll.setDocumentView(Some(&about_document));
+        about.addSubview(&about_scroll);
+
         self.ivars()
             .pane_heights
             .set([conn_height, global_height, about_height]);
@@ -1374,26 +1404,18 @@ impl SettingsController {
         let Some(window) = self.ivars().window.borrow().clone() else {
             return;
         };
+        let Some(screen) = window.screen().or_else(|| NSScreen::mainScreen(self.mtm())) else {
+            return;
+        };
         let wanted = self.ivars().pane_heights.get()[self.pane()];
         let frame = window.frame();
-        let content = window.contentRectForFrameRect(frame);
-        let chrome = frame.size.height - content.size.height;
-        let usable = window
-            .screen()
-            .or_else(|| NSScreen::mainScreen(self.mtm()))
-            .map(|screen| screen.visibleFrame().size.height - chrome)
-            .unwrap_or(wanted);
-        let height = wanted.min(usable);
-        if (content.size.height - height).abs() < 0.5 {
+        let chrome = frame.size.height - window.contentRectForFrameRect(frame).size.height;
+        let resized = fitted_frame(frame, chrome, wanted, screen.visibleFrame());
+        if (resized.size.height - frame.size.height).abs() < 0.5
+            && (resized.origin.y - frame.origin.y).abs() < 0.5
+        {
             return;
         }
-        let top = frame.origin.y + frame.size.height;
-        let resized = rect(
-            frame.origin.x,
-            top - height - chrome,
-            frame.size.width,
-            height + chrome,
-        );
         window.setFrame_display_animate(resized, true, window.isVisible());
     }
 
@@ -1953,4 +1975,37 @@ where
         .trim()
         .parse()
         .map_err(|_| format!("{label} must be a valid number."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fitted_frame, rect};
+
+    // A laptop-sized screen: 830 pt usable above an 70 pt Dock (y-up).
+    fn visible() -> objc2_core_foundation::CGRect {
+        rect(0.0, 70.0, 1440.0, 830.0)
+    }
+
+    #[test]
+    fn fitting_a_pane_keeps_the_top_edge_when_it_fits() {
+        let frame = rect(100.0, 500.0, 720.0, 400.0); // top edge at 900
+        let fitted = fitted_frame(frame, 80.0, 600.0, visible());
+        assert_eq!(fitted, rect(100.0, 220.0, 720.0, 680.0));
+    }
+
+    #[test]
+    fn growing_a_pane_never_pushes_the_bottom_below_the_screen() {
+        // Opened on a short pane, then switched to a taller one: keeping the
+        // top edge would put the bottom (and Save/Revert) at y = 30.
+        let frame = rect(100.0, 400.0, 720.0, 410.0); // top edge at 810
+        let fitted = fitted_frame(frame, 80.0, 700.0, visible());
+        assert_eq!(fitted, rect(100.0, 70.0, 720.0, 780.0));
+    }
+
+    #[test]
+    fn a_pane_taller_than_the_screen_is_capped_to_it() {
+        let frame = rect(100.0, 500.0, 720.0, 400.0);
+        let fitted = fitted_frame(frame, 80.0, 1000.0, visible());
+        assert_eq!(fitted, rect(100.0, 70.0, 720.0, 830.0));
+    }
 }
