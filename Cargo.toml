@@ -76,6 +76,40 @@ objc2-web-kit = { version = "0.3", default-features = false, features = [
 ] }
 block2 = "0.6"
 dispatch2 = "0.3"
+# H.264 hardware decode (VideoToolbox) for the graphics pipeline.
+objc2-video-toolbox = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2",
+    "block2",
+    "objc2-core-media",
+    "objc2-core-video",
+    "VTBase",
+    "VTDecompressionSession",
+    "VTDecompressionProperties",
+    "VTErrors",
+    "VTSession",
+] }
+objc2-core-media = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2",
+    "objc2-core-video",
+    "CMBase",
+    "CMBlockBuffer",
+    "CMFormatDescription",
+    "CMSampleBuffer",
+    "CMTime",
+] }
+objc2-core-video = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2",
+    "CVBase",
+    "CVBuffer",
+    "CVImageBuffer",
+    "CVPixelBuffer",
+    "CVReturn",
+] }
+yuv = { version = "0.8", default-features = false }
+openh264 = { version = "0.9", default-features = false, features = ["source"] }
 security-framework = "3"
 
 # --- serialization / storage ---
