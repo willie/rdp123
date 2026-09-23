@@ -686,9 +686,11 @@ fn install_main_menu(mtm: MainThreadMarker) {
 
     let main_menu = NSMenu::new(mtm);
 
-    // App menu (first slot): Quit with ⌘Q.
+    // App menu (first slot): Settings… with ⌘, and Quit with ⌘Q.
     let app_slot = NSMenuItem::new(mtm);
     let app_menu = NSMenu::new(mtm);
+    app_menu.addItem(&item(mtm, "Settings…", sel!(openSettings:), ","));
+    app_menu.addItem(&NSMenuItem::separatorItem(mtm));
     app_menu.addItem(&item(mtm, "Quit RDP123", sel!(terminate:), "q"));
     app_slot.setSubmenu(Some(&app_menu));
     main_menu.addItem(&app_slot);
