@@ -474,9 +474,13 @@ fn nal_units(data: &[u8]) -> Vec<&[u8]> {
     units
 }
 
-/// Same check as `ironrdp_egfx`'s decoder: a chain of nonzero 4-byte BE
-/// lengths that lands exactly on the end of the buffer.
+/// Same check as `ironrdp_egfx`'s decoder: a buffer that starts with a start
+/// code is Annex B; any other is length-prefixed if its nonzero 4-byte BE
+/// lengths chain exactly to the end of the buffer.
 fn is_length_prefixed(data: &[u8]) -> bool {
+    if data.starts_with(&[0, 0, 1]) || data.starts_with(&[0, 0, 0, 1]) {
+        return false;
+    }
     let mut offset = 0usize;
     loop {
         if offset == data.len() {
@@ -685,6 +689,32 @@ mod tests {
         assert_eq!((got.width(), got.height()), (w as u32, h as u32));
         let diff = max_difference(&got, &want);
         assert!(diff <= 2, "max channel difference {diff}");
+    }
+
+    #[test]
+    fn annex_b_that_also_parses_as_length_prefixed_stays_annex_b() {
+        // `00 00 01 67` read as a length is 0x167 = 359, so this 363-byte
+        // Annex B buffer is also a well-formed one-unit length-prefixed one.
+        // Trailing zero bytes are allowed after the last NAL unit.
+        let black = openh264::formats::YUVBuffer::new(16, 16);
+        let frame = openh264::encoder::Encoder::new()
+            .expect("encoder")
+            .encode(&black)
+            .expect("encode")
+            .to_vec();
+        let mut annex_b = vec![0, 0, 1];
+        annex_b.extend_from_slice(&frame[4..]);
+        assert!(annex_b.starts_with(&[0, 0, 1, 0x67]));
+        assert!(
+            annex_b.len() <= 363,
+            "test frame too large: {}",
+            annex_b.len()
+        );
+        annex_b.resize(363, 0);
+        assert!(!is_length_prefixed(&annex_b));
+        let mut vt = VideoToolboxDecoder::new();
+        vt.decode(&annex_b).expect("decode as Annex B");
+        assert!(vt.fallback.is_none());
     }
 
     #[test]
