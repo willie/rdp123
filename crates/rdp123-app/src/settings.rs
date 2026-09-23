@@ -107,41 +107,6 @@ fn fitted_frame(frame: CGRect, chrome: f64, wanted: f64, visible: CGRect) -> CGR
     rect(frame.origin.x, y, frame.size.width, height)
 }
 
-/// Before the tab view controller resizes the window for `pane`, which keeps
-/// the window's top edge, cap the pane to the screen and move the window up
-/// so the resized window ends above the Dock.
-fn make_room(window: &NSWindow, pane: &NSViewController, wanted: f64) {
-    let Some(screen) = window.screen() else {
-        return;
-    };
-    let frame = window.frame();
-    let chrome = frame.size.height - window.contentRectForFrameRect(frame).size.height;
-    let fitted = fitted_frame(frame, chrome, wanted, screen.visibleFrame());
-    pane.setPreferredContentSize(CGSize::new(W, fitted.size.height - chrome));
-    window.setFrameTopLeftPoint(CGPoint::new(
-        frame.origin.x,
-        fitted.origin.y + fitted.size.height,
-    ));
-}
-
-/// The same correction for a window that is already sized, when it opens.
-/// A window that isn't on screen yet has no screen; use the main one.
-fn keep_on_screen(window: &NSWindow) {
-    let Some(screen) = window
-        .screen()
-        .or_else(|| NSScreen::mainScreen(window.mtm()))
-    else {
-        return;
-    };
-    let frame = window.frame();
-    let content = window.contentRectForFrameRect(frame).size.height;
-    let chrome = frame.size.height - content;
-    let fitted = fitted_frame(frame, chrome, content, screen.visibleFrame());
-    if fitted != frame {
-        window.setFrame_display_animate(fitted, true, window.isVisible());
-    }
-}
-
 fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
     CGRect::new(CGPoint::new(x, y), CGSize::new(w, h))
 }
@@ -171,7 +136,7 @@ pub struct SettingsIvars {
     /// The window's content: one tab per entry in `PANES`, shown as a
     /// settings toolbar. It lives as long as the window, so reopening shows
     /// the pane people used last.
-    tabs: RefCell<Option<Retained<NSTabViewController>>>,
+    tabs: RefCell<Option<Retained<SettingsTabs>>>,
     save_button: Check,
     revert_button: Check,
     remove_button: Check,
@@ -444,7 +409,7 @@ define_class!(
 
 define_class!(
     /// The settings panes. AppKit sizes the window to each pane but lets it
-    /// grow past the bottom of the screen; `make_room` prevents that.
+    /// grow past the bottom of the screen; `fitted` prevents that.
     #[unsafe(super(NSTabViewController, NSViewController))]
     #[thread_kind = MainThreadOnly]
     #[name = "RDP123SettingsTabs"]
@@ -452,9 +417,18 @@ define_class!(
     struct SettingsTabs;
 
     impl SettingsTabs {
+        /// AppKit resizes the window after this, keeping its top edge; moving
+        /// the top first makes the resized window end above the Dock.
         #[unsafe(method(tabView:willSelectTabViewItem:))]
         fn will_select(&self, tab_view: &NSTabView, item: Option<&NSTabViewItem>) {
-            self.make_room_for(tab_view, item);
+            if let (Some(item), Some(window)) = (item, self.view().window()) {
+                if let Some(frame) = self.fitted(&window, item) {
+                    window.setFrameTopLeftPoint(CGPoint::new(
+                        frame.origin.x,
+                        frame.origin.y + frame.size.height,
+                    ));
+                }
+            }
             let _: () =
                 unsafe { msg_send![super(self), tabView: tab_view, willSelectTabViewItem: item] };
         }
@@ -468,21 +442,31 @@ impl SettingsTabs {
         unsafe { msg_send![super(this), init] }
     }
 
-    fn make_room_for(&self, tab_view: &NSTabView, item: Option<&NSTabViewItem>) {
-        let Some(item) = item else { return };
-        let Some(window) = self.view().window() else {
-            return;
-        };
-        let Some(pane) = item.viewController(self.mtm()) else {
-            return;
-        };
-        let index = tab_view.indexOfTabViewItem(item);
-        if let Some(&wanted) = usize::try_from(index)
-            .ok()
-            .and_then(|i| self.ivars().get(i))
-        {
-            make_room(&window, &pane, wanted);
+    /// When the window opens, size it for the selected pane: the saved frame
+    /// can have another pane's height or sit below the screen.
+    fn fit_window(&self, window: &NSWindow) {
+        if let Some(item) = self.tabView().selectedTabViewItem() {
+            if let Some(frame) = self.fitted(window, &item) {
+                window.setFrame_display(frame, true);
+            }
         }
+    }
+
+    /// The window frame that shows `item`'s pane, capped to the screen, with
+    /// the pane's preferred size capped to match. A window that isn't on
+    /// screen yet has no screen, so the main screen stands in.
+    fn fitted(&self, window: &NSWindow, item: &NSTabViewItem) -> Option<CGRect> {
+        let screen = window
+            .screen()
+            .or_else(|| NSScreen::mainScreen(self.mtm()))?;
+        let pane = item.viewController(self.mtm())?;
+        let index = usize::try_from(self.tabView().indexOfTabViewItem(item)).ok()?;
+        let wanted = *self.ivars().get(index)?;
+        let frame = window.frame();
+        let chrome = frame.size.height - window.contentRectForFrameRect(frame).size.height;
+        let fitted = fitted_frame(frame, chrome, wanted, screen.visibleFrame());
+        pane.setPreferredContentSize(CGSize::new(W, fitted.size.height - chrome));
+        Some(fitted)
     }
 }
 
@@ -538,13 +522,15 @@ impl SettingsController {
         self.select_row(first);
         self.update_visibility();
         if let Some(w) = self.ivars().window.borrow().as_ref() {
-            keep_on_screen(w);
+            if let Some(tabs) = self.ivars().tabs.borrow().as_ref() {
+                tabs.fit_window(w);
+            }
             w.makeKeyAndOrderFront(None);
         }
     }
 
     fn build(&self, mtm: MainThreadMarker) {
-        // Not user-resizable: the window fits each pane (`fit_window_to_pane`).
+        // Not user-resizable: the window fits each pane (`SettingsTabs`).
         // No minimize button: ⌘, reopens settings, so there is no reason to
         // keep it in the Dock.
         let style = NSWindowStyleMask::Titled | NSWindowStyleMask::Closable;
@@ -592,7 +578,7 @@ impl SettingsController {
             (global, global_height),
             (about, about_height),
         ];
-        let tabs = SettingsTabs::new(mtm, panes.iter().map(|(_, h)| *h).collect()).into_super();
+        let tabs = SettingsTabs::new(mtm, panes.iter().map(|(_, h)| *h).collect());
         tabs.setTabStyle(NSTabViewControllerTabStyle::Toolbar);
         for ((view, height), (id, title, symbol)) in panes.into_iter().zip(PANES) {
             let title = NSString::from_str(title);
