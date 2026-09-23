@@ -285,13 +285,14 @@ mod openh264_impl {
 
     impl H264Decoder for OpenH264Decoder {
         fn decode(&mut self, data: &[u8]) -> DecoderResult<DecodedFrame> {
-            // Same check as IronRDP #1986. AVC-format input is a chain of 4-byte
-            // BE lengths that lands exactly on the end of the buffer. Anything
-            // else is treated as the Annex B byte stream the specification
-            // defines. A start-code check alone would be ambiguous: an AVC
-            // buffer whose first NAL unit is 256..=511 bytes long also begins
-            // with 00 00 01.
-            let is_length_prefixed = {
+            // Same check as IronRDP #1986 (`pdu::is_avc_format`). A buffer that
+            // starts with a start code is the Annex B byte stream the
+            // specification defines; `00 00 01 67` followed by 359 bytes would
+            // otherwise also read as one AVC NAL unit. Any other buffer is AVC
+            // format if its 4-byte BE lengths chain exactly to the end.
+            let starts_with_start_code =
+                data.starts_with(&[0x00, 0x00, 0x01]) || data.starts_with(&[0x00, 0x00, 0x00, 0x01]);
+            let is_length_prefixed = !starts_with_start_code && {
                 let mut offset = 0usize;
                 loop {
                     if offset == data.len() {
@@ -410,5 +411,32 @@ mod tests {
         let data = vec![0xAAu8; 4 * 4 * 4];
         let frame = DecodedFrame::new(data.clone(), 4, 4);
         assert_eq!(frame.into_data(), data);
+    }
+
+    #[cfg(feature = "openh264-bundled")]
+    #[test]
+    fn annex_b_that_also_parses_as_avc_decodes_as_annex_b() {
+        use super::{H264Decoder as _, OpenH264Decoder};
+
+        // `00 00 01 67` read as a length is 0x167 = 359, so a 363-byte Annex B
+        // buffer starting with a 3-byte start code and an SPS is also a
+        // well-formed one-unit AVC buffer. Trailing zero bytes are allowed
+        // after the last NAL unit in Annex B.
+        let mut encoder = openh264::encoder::Encoder::new().expect("encoder");
+        let encoded = encoder
+            .encode(&openh264::formats::YUVBuffer::new(16, 16))
+            .expect("encode")
+            .to_vec();
+        let mut annex_b = vec![0x00, 0x00, 0x01];
+        annex_b.extend_from_slice(&encoded[4..]);
+        assert!(annex_b.starts_with(&[0x00, 0x00, 0x01, 0x67]));
+        assert!(annex_b.len() <= 363);
+        annex_b.resize(363, 0);
+
+        let frame = OpenH264Decoder::new()
+            .expect("decoder")
+            .decode(&annex_b)
+            .expect("decode as Annex B");
+        assert_eq!((frame.width(), frame.height()), (16, 16));
     }
 }
