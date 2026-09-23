@@ -25,7 +25,7 @@ use objc2_app_kit::{
     NSGridRowAlignment, NSGridView, NSImage, NSImageName, NSImageNameAddTemplate,
     NSImageNameRemoveTemplate, NSImageScaling, NSImageView, NSLayoutAttribute, NSLineBreakMode,
     NSPasteboard, NSPasteboardTypeString, NSPopUpButton, NSScreen, NSScrollView, NSSecureTextField,
-    NSStackView, NSStackViewDistribution, NSTableColumn, NSTableView,
+    NSStackView, NSStackViewDistribution, NSStackViewGravity, NSTableColumn, NSTableView,
     NSTableViewColumnAutoresizingStyle, NSTableViewDataSource, NSTableViewDelegate,
     NSTableViewStyle, NSTextAlignment, NSTextField, NSTextFieldDelegate, NSToolbar,
     NSToolbarDelegate, NSToolbarDisplayMode, NSToolbarItem, NSUserInterfaceLayoutOrientation,
@@ -76,18 +76,12 @@ const W: f64 = 720.0;
 /// Content height the panes are built at, and the About pane's height. The
 /// window then resizes to fit whichever pane is visible.
 const CH: f64 = 716.0;
-/// Strip along the bottom of the Connections pane for +/− and Revert/Save.
-const BUTTON_BAR: f64 = 56.0;
-/// Frame of the Revert/Save row; the +/− buttons are centered on it.
-const BOTTOM_ROW_Y: f64 = 16.0;
-const BOTTOM_ROW_H: f64 = 30.0;
 /// Space between the window edge and its content, on every side.
 const MARGIN: f64 = 16.0;
 const INDENT: f64 = 20.0; // leading indent of a control that depends on the row above
-const FORM_X: f64 = 224.0;
+const LIST_W: f64 = 190.0; // the connection list
 const LABEL_W: f64 = 150.0;
 const FIELD_W: f64 = 322.0;
-const ROW_H: f64 = 22.0;
 
 /// Toolbar panes: (item identifier, title, SF Symbol).
 const PANES: [(&str, &str, &str); 3] = [
@@ -738,29 +732,18 @@ impl SettingsController {
     /// Returns the pane's preferred content height: the editor's tallest
     /// (RDP, password) layout plus the button bar.
     fn build_connection_pane(&self, mtm: MainThreadMarker, parent: &NSView) -> f64 {
-        // ---- connection list (grows with the window) ----
-        // A header names the single-column list (HIG: lists and tables),
-        // aligned with the editor's first section heading.
-        let header = self.label(
-            mtm,
-            parent,
-            rect(MARGIN, CH - MARGIN - 17.0, 190.0, 17.0),
-            "Connections",
-        );
-        header.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
-        header.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinYMargin);
+        // The pane's parts are created here and placed with constraints at
+        // the end: list column on the left, editor on the right, and a bar
+        // with add/remove and Revert/Save along the bottom.
 
-        // Add/remove buttons share the bottom row's center line with
-        // Revert/Save, and leave room above them for the list's focus ring.
-        let (button_w, button_h) = (24.0, 22.0);
-        let buttons_y = BOTTOM_ROW_Y + (BOTTOM_ROW_H - button_h) / 2.0;
-        let list_bottom = buttons_y + button_h + 8.0;
-        let list_top = CH - MARGIN - 17.0 - 6.0;
-        let scroll = NSScrollView::initWithFrame(
-            NSScrollView::alloc(mtm),
-            rect(MARGIN, list_bottom, 190.0, list_top - list_bottom),
-        );
-        scroll.setAutoresizingMask(NSAutoresizingMaskOptions::ViewHeightSizable);
+        // ---- connection list ----
+        // A header names the single-column list (HIG: lists and tables).
+        let header = NSTextField::labelWithString(&NSString::from_str("Connections"), mtm);
+        header.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
+        // Created at its final width so the table's one column starts at
+        // the full width; only the height changes afterwards.
+        let scroll =
+            NSScrollView::initWithFrame(NSScrollView::alloc(mtm), rect(0.0, 0.0, LIST_W, CH));
         scroll.setHasVerticalScroller(true);
         scroll.setAutohidesScrollers(true);
         scroll.setBorderType(NSBorderType::BezelBorder);
@@ -790,75 +773,77 @@ impl SettingsController {
         scroll.setDocumentView(Some(&table));
         // The one column spans the list, so names use the full row width.
         table.sizeLastColumnToFit();
-        parent.addSubview(&scroll);
-        *self.ivars().table.borrow_mut() = Some(table);
+        *self.ivars().table.borrow_mut() = Some(table.clone());
 
-        let list_button = |image: &NSImageName, x: f64, action: Sel| {
+        // ---- bottom bar: add/remove on the left, Revert/Save on the right,
+        // on one center line ----
+        let button = |title: &str, action: Sel| unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str(title),
+                Some(self.any()),
+                Some(action),
+                mtm,
+            )
+        };
+        let list_button = |image: &NSImageName, action: Sel| {
             let image = NSImage::imageNamed(image).expect("system add/remove image");
             let b = unsafe {
                 NSButton::buttonWithImage_target_action(&image, Some(self.any()), Some(action), mtm)
             };
             b.setBezelStyle(NSBezelStyle::SmallSquare);
-            b.setFrame(rect(x, buttons_y, button_w, button_h));
-            parent.addSubview(&b);
+            b.widthAnchor()
+                .constraintEqualToConstant(24.0)
+                .setActive(true);
+            b.heightAnchor()
+                .constraintEqualToConstant(22.0)
+                .setActive(true);
             b
         };
-        let add = list_button(
-            unsafe { NSImageNameAddTemplate },
-            MARGIN,
-            sel!(addConnection:),
-        );
+        let add = list_button(unsafe { NSImageNameAddTemplate }, sel!(addConnection:));
         add.setToolTip(Some(&NSString::from_str("Add a connection")));
         let remove = list_button(
             unsafe { NSImageNameRemoveTemplate },
-            MARGIN + button_w - 1.0,
             sel!(removeConnection:),
         );
         remove.setToolTip(Some(&NSString::from_str("Remove the selected connection")));
         remove.setEnabled(false);
+        let add_remove = NSStackView::stackViewWithViews(
+            &NSArray::from_retained_slice(&[
+                add.retain().into_super().into_super(),
+                remove.retain().into_super().into_super(),
+            ]),
+            mtm,
+        );
+        add_remove.setSpacing(0.0); // the two square buttons touch
         *self.ivars().remove_button.borrow_mut() = Some(remove);
 
-        let save = self.button_ret(
-            mtm,
-            parent,
-            rect(W - MARGIN - 108.0, BOTTOM_ROW_Y, 108.0, BOTTOM_ROW_H),
-            "Save",
-            sel!(saveConnection:),
-        );
+        let save = button("Save", sel!(saveConnection:));
         // Return key triggers Save (standard default-button behavior).
         save.setKeyEquivalent(&NSString::from_str("\r"));
-        let revert = self.button_ret(
-            mtm,
-            parent,
-            rect(
-                W - MARGIN - 2.0 * 108.0 - 8.0,
-                BOTTOM_ROW_Y,
-                108.0,
-                BOTTOM_ROW_H,
-            ),
-            "Revert",
-            sel!(revertConnection:),
-        );
+        let revert = button("Revert", sel!(revertConnection:));
         save.setEnabled(false);
         revert.setEnabled(false);
+        let bar = NSStackView::stackViewWithViews(&NSArray::new(), mtm);
+        bar.addView_inGravity(&add_remove, NSStackViewGravity::Leading);
+        bar.addView_inGravity(&revert, NSStackViewGravity::Trailing);
+        bar.addView_inGravity(&save, NSStackViewGravity::Trailing);
+        // Only once both share the bar can their widths be related.
+        revert
+            .widthAnchor()
+            .constraintEqualToAnchor(&save.widthAnchor())
+            .setActive(true);
         *self.ivars().save_button.borrow_mut() = Some(save);
         *self.ivars().revert_button.borrow_mut() = Some(revert);
 
         let dirty = sel!(markDirty:);
 
-        // Shown when the list is empty / nothing is selected.
-        let empty = self.label(
+        // Shown in the editor area when the list is empty / nothing is selected.
+        let empty_state = NSTextField::labelWithString(
+            &NSString::from_str("No connection selected — click + to add one."),
             mtm,
-            parent,
-            rect(FORM_X, CH / 2.0, 460.0, ROW_H),
-            "No connection selected — click + to add one.",
         );
-        empty.setAlignment(NSTextAlignment::Center);
-        empty.setAutoresizingMask(
-            NSAutoresizingMaskOptions::ViewMinYMargin | NSAutoresizingMaskOptions::ViewMaxYMargin,
-        );
-        self.muted(&empty);
-        *self.ivars().empty_label.borrow_mut() = Some(empty);
+        self.muted(&empty_state);
+        *self.ivars().empty_label.borrow_mut() = Some(empty_state.clone());
 
         // ---- editor: one grid, rows listed in order ----
         // Every row belongs to a group; `update_visibility` hides whole rows,
@@ -1116,33 +1101,107 @@ impl SettingsController {
         for row in ssh.iter().chain(&entra_auth) {
             row.setHidden(true);
         }
-        let editor_height = MARGIN + grid.fittingSize().height + MARGIN;
+        let grid_height = grid.fittingSize().height;
+        // Fields end exactly at the right margin: the control column is the
+        // field width and the grid is pinned by its trailing edge.
+        grid.columnAtIndex(1).setWidth(FIELD_W);
 
         // The editor scrolls only when the screen is too short for it; the
-        // list and the button bar stay in place.
-        let editor = NSScrollView::initWithFrame(
-            NSScrollView::alloc(mtm),
-            rect(FORM_X - 8.0, BUTTON_BAR, W - FORM_X + 8.0, CH - BUTTON_BAR),
-        );
-        editor.setAutoresizingMask(NSAutoresizingMaskOptions::ViewHeightSizable);
+        // list and the button bar stay in place. Its flipped document takes
+        // its height from the grid, so it shows from the top.
+        let editor = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), CGRect::ZERO);
         editor.setBorderType(NSBorderType::NoBorder);
         editor.setHasVerticalScroller(true);
         editor.setAutohidesScrollers(true);
         editor.setDrawsBackground(false);
-        let document = FlippedView::new(mtm, rect(0.0, 0.0, W - FORM_X + 8.0, editor_height));
-        grid.setTranslatesAutoresizingMaskIntoConstraints(false);
-        document.addSubview(&grid);
-        grid.topAnchor()
-            .constraintEqualToAnchor_constant(&document.topAnchor(), MARGIN)
-            .setActive(true);
-        // Place the grid so the field column ends at the window's right
-        // margin, using the grid's actual column spacing.
-        let grid_x = W - MARGIN - FIELD_W - grid.columnSpacing() - LABEL_W;
-        grid.leadingAnchor()
-            .constraintEqualToAnchor_constant(&document.leadingAnchor(), grid_x - (FORM_X - 8.0))
-            .setActive(true);
+        let document = FlippedView::new(mtm, CGRect::ZERO);
         editor.setDocumentView(Some(&document));
-        parent.addSubview(&editor);
+        document.addSubview(&grid);
+
+        let edges: [&NSView; 7] = [
+            &header,
+            &scroll,
+            &bar,
+            &editor,
+            &empty_state,
+            &document,
+            &grid,
+        ];
+        for v in edges {
+            v.setTranslatesAutoresizingMaskIntoConstraints(false);
+        }
+        for v in [&*header as &NSView, &scroll, &bar, &editor, &empty_state] {
+            parent.addSubview(v);
+        }
+        let clip = editor.contentView();
+        let margin = MARGIN;
+        for constraint in [
+            // List column: header, then the list down to the bar, leaving
+            // room for the list's focus ring.
+            header
+                .topAnchor()
+                .constraintEqualToAnchor_constant(&parent.topAnchor(), margin),
+            header
+                .leadingAnchor()
+                .constraintEqualToAnchor_constant(&parent.leadingAnchor(), margin),
+            scroll
+                .topAnchor()
+                .constraintEqualToAnchor_constant(&header.bottomAnchor(), 6.0),
+            scroll
+                .leadingAnchor()
+                .constraintEqualToAnchor(&header.leadingAnchor()),
+            scroll.widthAnchor().constraintEqualToConstant(LIST_W),
+            scroll
+                .bottomAnchor()
+                .constraintEqualToAnchor_constant(&bar.topAnchor(), -8.0),
+            // Bottom bar spans the window inside the margins.
+            bar.leadingAnchor()
+                .constraintEqualToAnchor_constant(&parent.leadingAnchor(), margin),
+            bar.trailingAnchor()
+                .constraintEqualToAnchor_constant(&parent.trailingAnchor(), -margin),
+            bar.bottomAnchor()
+                .constraintEqualToAnchor_constant(&parent.bottomAnchor(), -margin),
+            // Editor fills the rest; its grid starts level with the header.
+            editor
+                .topAnchor()
+                .constraintEqualToAnchor(&parent.topAnchor()),
+            editor
+                .leadingAnchor()
+                .constraintEqualToAnchor_constant(&scroll.trailingAnchor(), margin),
+            editor
+                .trailingAnchor()
+                .constraintEqualToAnchor(&parent.trailingAnchor()),
+            editor
+                .bottomAnchor()
+                .constraintEqualToAnchor_constant(&bar.topAnchor(), -8.0),
+            document
+                .topAnchor()
+                .constraintEqualToAnchor(&clip.topAnchor()),
+            document
+                .leadingAnchor()
+                .constraintEqualToAnchor(&clip.leadingAnchor()),
+            document
+                .widthAnchor()
+                .constraintEqualToAnchor(&clip.widthAnchor()),
+            grid.topAnchor()
+                .constraintEqualToAnchor_constant(&document.topAnchor(), margin),
+            grid.trailingAnchor()
+                .constraintEqualToAnchor_constant(&document.trailingAnchor(), -margin),
+            document
+                .bottomAnchor()
+                .constraintEqualToAnchor_constant(&grid.bottomAnchor(), margin),
+            // The empty-state message is centered in the editor area.
+            empty_state
+                .centerXAnchor()
+                .constraintEqualToAnchor(&editor.centerXAnchor()),
+            empty_state
+                .centerYAnchor()
+                .constraintEqualToAnchor(&editor.centerYAnchor()),
+        ] {
+            constraint.setActive(true);
+        }
+        let editor_height = margin + grid_height + margin;
+        let bar_height = bar.fittingSize().height;
 
         let ivars = self.ivars();
         *ivars.name.borrow_mut() = Some(name);
@@ -1175,7 +1234,7 @@ impl SettingsController {
         *ivars.entra_auth_group.borrow_mut() = entra_auth;
         *ivars.ssh_group.borrow_mut() = ssh;
 
-        BUTTON_BAR + editor_height
+        editor_height + 8.0 + bar_height + MARGIN
     }
 
     /// Laid out by an `NSGridView`: a right-aligned label column and a control
@@ -1199,11 +1258,8 @@ impl SettingsController {
         let view = |v: &NSView| -> Retained<NSView> { v.retain() };
         let empty = || NSGridCell::emptyContentView(mtm);
 
-        let term = NSPopUpButton::initWithFrame_pullsDown(
-            NSPopUpButton::alloc(mtm),
-            rect(0.0, 0.0, 240.0, ROW_H + 2.0),
-            false,
-        );
+        let term =
+            NSPopUpButton::initWithFrame_pullsDown(NSPopUpButton::alloc(mtm), CGRect::ZERO, false);
         for kind in TerminalKind::ALL {
             term.addItemWithTitle(&NSString::from_str(kind.display_name()));
         }
@@ -1332,19 +1388,6 @@ impl SettingsController {
 
     // ---------- small control builders ----------
 
-    fn label(
-        &self,
-        mtm: MainThreadMarker,
-        parent: &NSView,
-        f: CGRect,
-        text: &str,
-    ) -> Retained<NSTextField> {
-        let l = NSTextField::labelWithString(&NSString::from_str(text), mtm);
-        l.setFrame(f);
-        parent.addSubview(&l);
-        l
-    }
-
     /// Colour a label as secondary/muted text.
     fn muted(&self, label: &NSTextField) {
         label.setTextColor(Some(&NSColor::secondaryLabelColor()));
@@ -1364,27 +1407,6 @@ impl SettingsController {
         b.setAlignment(NSTextAlignment::Left);
         b.setFont(Some(&NSFont::systemFontOfSize(11.0)));
         b.setContentTintColor(Some(&NSColor::linkColor()));
-        b
-    }
-
-    fn button_ret(
-        &self,
-        mtm: MainThreadMarker,
-        parent: &NSView,
-        f: CGRect,
-        title: &str,
-        action: Sel,
-    ) -> Retained<NSButton> {
-        let b = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                &NSString::from_str(title),
-                Some(self.any()),
-                Some(action),
-                mtm,
-            )
-        };
-        b.setFrame(f);
-        parent.addSubview(&b);
         b
     }
 
