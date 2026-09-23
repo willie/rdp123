@@ -27,13 +27,14 @@ use objc2_app_kit::{
     NSControlStateValueOn, NSControlTextEditingDelegate, NSFont, NSFontAttributeName, NSGridCell,
     NSGridCellPlacement, NSGridRow, NSGridRowAlignment, NSGridView, NSImage, NSImageName,
     NSImageNameAddTemplate, NSImageNameRemoveTemplate, NSImageScaling, NSImageView,
-    NSLayoutAttribute, NSLineBreakMode, NSLinkAttributeName, NSPasteboard, NSPasteboardTypeString,
-    NSPopUpButton, NSScreen, NSScrollView, NSSecureTextField, NSStackView, NSStackViewDistribution,
-    NSStackViewGravity, NSTableCellView, NSTableColumn, NSTableView,
+    NSLayoutAttribute, NSLineBreakMode, NSLinkAttributeName, NSObjectNSKeyValueBindingCreation,
+    NSPasteboard, NSPasteboardTypeString, NSPopUpButton, NSScreen, NSScrollView, NSSecureTextField,
+    NSStackView, NSStackViewDistribution, NSStackViewGravity, NSTabView, NSTabViewController,
+    NSTabViewControllerTabStyle, NSTabViewItem, NSTableCellView, NSTableColumn, NSTableView,
     NSTableViewColumnAutoresizingStyle, NSTableViewDataSource, NSTableViewDelegate,
-    NSTableViewStyle, NSTextField, NSTextFieldDelegate, NSToolbar, NSToolbarDelegate,
-    NSToolbarDisplayMode, NSToolbarItem, NSUserInterfaceLayoutOrientation, NSView, NSWindow,
-    NSWindowDelegate, NSWindowStyleMask, NSWindowToolbarStyle,
+    NSTableViewStyle, NSTextField, NSTextFieldDelegate, NSTitleBinding,
+    NSUserInterfaceLayoutOrientation, NSView, NSViewController, NSWindow, NSWindowDelegate,
+    NSWindowStyleMask,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{
@@ -95,10 +96,6 @@ const PANES: [(&str, &str, &str); 3] = [
     ("about", "About", "info.circle"),
 ];
 
-fn pane_identifiers() -> Retained<NSArray<NSString>> {
-    NSArray::from_retained_slice(&PANES.map(|(id, ..)| NSString::from_str(id)))
-}
-
 /// The window frame that shows `wanted` points of content below `chrome`
 /// (title bar and toolbar): the top edge stays put and the height is capped
 /// at the screen's usable area. If growing would push the bottom (and the
@@ -108,6 +105,41 @@ fn fitted_frame(frame: CGRect, chrome: f64, wanted: f64, visible: CGRect) -> CGR
     let top = frame.origin.y + frame.size.height;
     let y = (top - height).max(visible.origin.y);
     rect(frame.origin.x, y, frame.size.width, height)
+}
+
+/// Before the tab view controller resizes the window for `pane`, which keeps
+/// the window's top edge, cap the pane to the screen and move the window up
+/// so the resized window ends above the Dock.
+fn make_room(window: &NSWindow, pane: &NSViewController, wanted: f64) {
+    let Some(screen) = window.screen() else {
+        return;
+    };
+    let frame = window.frame();
+    let chrome = frame.size.height - window.contentRectForFrameRect(frame).size.height;
+    let fitted = fitted_frame(frame, chrome, wanted, screen.visibleFrame());
+    pane.setPreferredContentSize(CGSize::new(W, fitted.size.height - chrome));
+    window.setFrameTopLeftPoint(CGPoint::new(
+        frame.origin.x,
+        fitted.origin.y + fitted.size.height,
+    ));
+}
+
+/// The same correction for a window that is already sized, when it opens.
+/// A window that isn't on screen yet has no screen; use the main one.
+fn keep_on_screen(window: &NSWindow) {
+    let Some(screen) = window
+        .screen()
+        .or_else(|| NSScreen::mainScreen(window.mtm()))
+    else {
+        return;
+    };
+    let frame = window.frame();
+    let content = window.contentRectForFrameRect(frame).size.height;
+    let chrome = frame.size.height - content;
+    let fitted = fitted_frame(frame, chrome, content, screen.visibleFrame());
+    if fitted != frame {
+        window.setFrame_display_animate(fitted, true, window.isVisible());
+    }
 }
 
 fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
@@ -136,15 +168,10 @@ pub struct SettingsIvars {
     built: Cell<bool>,
     window: RefCell<Option<Retained<NSWindow>>>,
     table: RefCell<Option<Retained<NSTableView>>>,
-    /// Index into `PANES` of the visible pane; kept across openings so the
-    /// window returns to the pane people used last.
-    pane: Cell<usize>,
-    toolbar: RefCell<Option<Retained<NSToolbar>>>,
-    conn_pane: RefCell<Option<Retained<NSView>>>,
-    global_pane: RefCell<Option<Retained<NSView>>>,
-    about_pane: RefCell<Option<Retained<NSView>>>,
-    /// Preferred content height of each pane, in `PANES` order.
-    pane_heights: Cell<[f64; 3]>,
+    /// The window's content: one tab per entry in `PANES`, shown as a
+    /// settings toolbar. It lives as long as the window, so reopening shows
+    /// the pane people used last.
+    tabs: RefCell<Option<Retained<NSTabViewController>>>,
     save_button: Check,
     revert_button: Check,
     remove_button: Check,
@@ -261,33 +288,6 @@ define_class!(
         }
     }
 
-    unsafe impl NSToolbarDelegate for SettingsController {
-        #[unsafe(method_id(toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:))]
-        fn toolbar_item(
-            &self,
-            _toolbar: &NSToolbar,
-            identifier: &NSString,
-            _will_insert: bool,
-        ) -> Option<Retained<NSToolbarItem>> {
-            self.pane_toolbar_item(identifier)
-        }
-
-        #[unsafe(method_id(toolbarDefaultItemIdentifiers:))]
-        fn toolbar_default_items(&self, _toolbar: &NSToolbar) -> Retained<NSArray<NSString>> {
-            pane_identifiers()
-        }
-
-        #[unsafe(method_id(toolbarAllowedItemIdentifiers:))]
-        fn toolbar_allowed_items(&self, _toolbar: &NSToolbar) -> Retained<NSArray<NSString>> {
-            pane_identifiers()
-        }
-
-        #[unsafe(method_id(toolbarSelectableItemIdentifiers:))]
-        fn toolbar_selectable_items(&self, _toolbar: &NSToolbar) -> Retained<NSArray<NSString>> {
-            pane_identifiers()
-        }
-    }
-
     impl SettingsController {
         #[unsafe(method(addConnection:))]
         fn add(&self, _s: Option<&AnyObject>) {
@@ -392,18 +392,6 @@ define_class!(
             self.update_visibility();
         }
 
-        #[unsafe(method(paneChanged:))]
-        fn pane_changed(&self, sender: Option<&AnyObject>) {
-            let Some(item) = sender.and_then(|s| s.downcast_ref::<NSToolbarItem>()) else {
-                return;
-            };
-            let id = item.itemIdentifier().to_string();
-            if let Some(index) = PANES.iter().position(|(pane_id, ..)| *pane_id == id) {
-                self.ivars().pane.set(index);
-            }
-            self.update_visibility();
-        }
-
         #[unsafe(method(globalChanged:))]
         fn global_changed(&self, _s: Option<&AnyObject>) {
             self.save_global();
@@ -453,6 +441,50 @@ define_class!(
         }
     }
 );
+
+define_class!(
+    /// The settings panes. AppKit sizes the window to each pane but lets it
+    /// grow past the bottom of the screen; `make_room` prevents that.
+    #[unsafe(super(NSTabViewController, NSViewController))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "RDP123SettingsTabs"]
+    #[ivars = Vec<f64>]
+    struct SettingsTabs;
+
+    impl SettingsTabs {
+        #[unsafe(method(tabView:willSelectTabViewItem:))]
+        fn will_select(&self, tab_view: &NSTabView, item: Option<&NSTabViewItem>) {
+            self.make_room_for(tab_view, item);
+            let _: () =
+                unsafe { msg_send![super(self), tabView: tab_view, willSelectTabViewItem: item] };
+        }
+    }
+);
+
+impl SettingsTabs {
+    /// `heights` holds each pane's full content height, in tab order.
+    fn new(mtm: MainThreadMarker, heights: Vec<f64>) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(heights);
+        unsafe { msg_send![super(this), init] }
+    }
+
+    fn make_room_for(&self, tab_view: &NSTabView, item: Option<&NSTabViewItem>) {
+        let Some(item) = item else { return };
+        let Some(window) = self.view().window() else {
+            return;
+        };
+        let Some(pane) = item.viewController(self.mtm()) else {
+            return;
+        };
+        let index = tab_view.indexOfTabViewItem(item);
+        if let Some(&wanted) = usize::try_from(index)
+            .ok()
+            .and_then(|i| self.ivars().get(i))
+        {
+            make_room(&window, &pane, wanted);
+        }
+    }
+}
 
 impl FlippedView {
     fn new(mtm: MainThreadMarker, frame: CGRect) -> Retained<Self> {
@@ -506,6 +538,7 @@ impl SettingsController {
         self.select_row(first);
         self.update_visibility();
         if let Some(w) = self.ivars().window.borrow().as_ref() {
+            keep_on_screen(w);
             w.makeKeyAndOrderFront(None);
         }
     }
@@ -525,38 +558,11 @@ impl SettingsController {
             )
         };
         unsafe { window.setReleasedWhenClosed(false) };
-        // Reopen where it was left; center only the first time.
-        let autosave = NSString::from_str("RDP123Settings");
-        if !window.setFrameUsingName(&autosave) {
-            window.center();
-        }
-        window.setFrameAutosaveName(&autosave);
         window.setDelegate(Some(ProtocolObject::from_ref(self)));
-        let content = window.contentView().expect("content view");
 
-        // ---- pane switch: a settings toolbar ----
-        let toolbar = NSToolbar::initWithIdentifier(
-            NSToolbar::alloc(mtm),
-            &NSString::from_str("RDP123Settings"),
-        );
-        toolbar.setDelegate(Some(ProtocolObject::from_ref(self)));
-        toolbar.setAllowsUserCustomization(false);
-        toolbar.setDisplayMode(NSToolbarDisplayMode::IconAndLabel);
-        window.setToolbarStyle(NSWindowToolbarStyle::Preference);
-        window.setToolbar(Some(&toolbar));
-        *self.ivars().toolbar.borrow_mut() = Some(toolbar);
-
-        // ---- panes: each fills the content view; the window fits the
-        // visible pane's preferred height (see `fit_window_to_pane`) ----
-        let pane_view = || {
-            let v = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, W, CH));
-            v.setAutoresizingMask(
-                NSAutoresizingMaskOptions::ViewWidthSizable
-                    | NSAutoresizingMaskOptions::ViewHeightSizable,
-            );
-            content.addSubview(&v);
-            v
-        };
+        // ---- panes: built at full size; the tab view controller sizes the
+        // window to each pane's preferred content size ----
+        let pane_view = || NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, W, CH));
         let conn = pane_view();
         let global = pane_view();
         let about = pane_view();
@@ -580,13 +586,51 @@ impl SettingsController {
         about_scroll.setDocumentView(Some(&about_document));
         about.addSubview(&about_scroll);
 
-        self.ivars()
-            .pane_heights
-            .set([conn_height, global_height, about_height]);
+        // ---- pane switch: a tab view controller in toolbar style ----
+        let panes = [
+            (conn, conn_height),
+            (global, global_height),
+            (about, about_height),
+        ];
+        let tabs = SettingsTabs::new(mtm, panes.iter().map(|(_, h)| *h).collect()).into_super();
+        tabs.setTabStyle(NSTabViewControllerTabStyle::Toolbar);
+        for ((view, height), (id, title, symbol)) in panes.into_iter().zip(PANES) {
+            let title = NSString::from_str(title);
+            let controller = NSViewController::new(mtm);
+            controller.setView(&view);
+            controller.setTitle(Some(&title));
+            controller.setPreferredContentSize(CGSize::new(W, height));
+            let item = NSTabViewItem::tabViewItemWithViewController(&controller);
+            item.setLabel(&title);
+            item.setImage(
+                NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                    &NSString::from_str(symbol),
+                    Some(&title),
+                )
+                .as_deref(),
+            );
+            unsafe { item.setIdentifier(Some(&NSString::from_str(id))) };
+            tabs.addTabViewItem(&item);
+        }
+        window.setContentViewController(Some(&tabs));
+        // The controller takes the selected pane's title; the window shows it.
+        unsafe {
+            window.bind_toObject_withKeyPath_options(
+                NSTitleBinding,
+                &tabs,
+                &NSString::from_str("title"),
+                None,
+            );
+        }
 
-        *self.ivars().conn_pane.borrow_mut() = Some(conn);
-        *self.ivars().global_pane.borrow_mut() = Some(global);
-        *self.ivars().about_pane.borrow_mut() = Some(about);
+        // Reopen where it was left; center only the first time.
+        let autosave = NSString::from_str("RDP123Settings");
+        if !window.setFrameUsingName(&autosave) {
+            window.center();
+        }
+        window.setFrameAutosaveName(&autosave);
+
+        *self.ivars().tabs.borrow_mut() = Some(tabs);
         *self.ivars().window.borrow_mut() = Some(window);
     }
 
@@ -1492,50 +1536,13 @@ impl SettingsController {
         Some(cell.into_super())
     }
 
-    fn pane_toolbar_item(&self, identifier: &NSString) -> Option<Retained<NSToolbarItem>> {
-        let id = identifier.to_string();
-        let (_, title, symbol) = PANES.iter().find(|(pane_id, ..)| *pane_id == id)?;
-        let item =
-            NSToolbarItem::initWithItemIdentifier(NSToolbarItem::alloc(self.mtm()), identifier);
-        let title = NSString::from_str(title);
-        item.setLabel(&title);
-        item.setImage(
-            NSImage::imageWithSystemSymbolName_accessibilityDescription(
-                &NSString::from_str(symbol),
-                Some(&title),
-            )
-            .as_deref(),
-        );
-        unsafe {
-            item.setTarget(Some(self.any()));
-            item.setAction(Some(sel!(paneChanged:)));
-        }
-        Some(item)
-    }
-
+    /// Index into `PANES` of the visible pane.
     fn pane(&self) -> usize {
-        self.ivars().pane.get()
-    }
-
-    /// Resize the window to the visible pane's preferred height, keeping the
-    /// top edge in place and never growing past the screen's usable height.
-    fn fit_window_to_pane(&self) {
-        let Some(window) = self.ivars().window.borrow().clone() else {
-            return;
-        };
-        let Some(screen) = window.screen().or_else(|| NSScreen::mainScreen(self.mtm())) else {
-            return;
-        };
-        let wanted = self.ivars().pane_heights.get()[self.pane()];
-        let frame = window.frame();
-        let chrome = frame.size.height - window.contentRectForFrameRect(frame).size.height;
-        let resized = fitted_frame(frame, chrome, wanted, screen.visibleFrame());
-        if (resized.size.height - frame.size.height).abs() < 0.5
-            && (resized.origin.y - frame.origin.y).abs() < 0.5
-        {
-            return;
-        }
-        window.setFrame_display_animate(resized, true, window.isVisible());
+        self.ivars()
+            .tabs
+            .borrow()
+            .as_ref()
+            .map_or(0, |t| t.selectedTabViewItemIndex().max(0) as usize)
     }
 
     fn save_document(&self, document: &Document) -> bool {
@@ -1678,24 +1685,6 @@ impl SettingsController {
     }
 
     fn update_visibility(&self) {
-        let pane = self.pane();
-        if let Some(c) = self.ivars().conn_pane.borrow().as_ref() {
-            c.setHidden(pane != 0);
-        }
-        if let Some(g) = self.ivars().global_pane.borrow().as_ref() {
-            g.setHidden(pane != 1);
-        }
-        if let Some(a) = self.ivars().about_pane.borrow().as_ref() {
-            a.setHidden(pane != 2);
-        }
-        let (id, title, _) = PANES[pane];
-        if let Some(w) = self.ivars().window.borrow().as_ref() {
-            w.setTitle(&NSString::from_str(title));
-        }
-        if let Some(t) = self.ivars().toolbar.borrow().as_ref() {
-            t.setSelectedItemIdentifier(Some(&NSString::from_str(id)));
-        }
-        self.fit_window_to_pane();
         let has_selection = self.ivars().selected.get() >= 0;
         let is_ssh = self
             .ivars()
