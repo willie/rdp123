@@ -123,5 +123,7 @@ ironrdp-connector = { path = "vendor/ironrdp-connector" }
 # frame or rendering black/white block artifacts.
 ironrdp-graphics = { path = "vendor/ironrdp-graphics" }
 # ironrdp-egfx 0.3.0 from crates.io, vendored to carry AVC420 fixes for servers
-# built on FreeRDP's server library, such as GNOME Remote Desktop.
+# built on FreeRDP's server library, such as GNOME Remote Desktop:
+# - Annex B input is decoded as sent instead of being misread as
+#   length-prefixed NAL units (same detection as upstream PR #1986, open).
 ironrdp-egfx = { path = "vendor/ironrdp-egfx" }
