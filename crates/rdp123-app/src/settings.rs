@@ -19,12 +19,14 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
-    NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSBorderType, NSBox, NSBoxType,
-    NSButton, NSColor, NSControlStateValueOff, NSControlStateValueOn, NSControlTextEditingDelegate,
-    NSFont, NSGridCell, NSGridCellPlacement, NSGridRow, NSGridRowAlignment, NSGridView, NSImage,
-    NSImageView, NSPasteboard, NSPasteboardTypeString, NSPopUpButton, NSScreen, NSScrollView,
-    NSSecureTextField, NSStackView, NSTableColumn, NSTableView, NSTableViewDataSource,
-    NSTableViewDelegate, NSTextAlignment, NSTextField, NSTextFieldDelegate, NSToolbar,
+    NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSBezelStyle, NSBorderType,
+    NSBox, NSBoxType, NSButton, NSCell, NSColor, NSControlStateValueOff, NSControlStateValueOn,
+    NSControlTextEditingDelegate, NSFont, NSGridCell, NSGridCellPlacement, NSGridRow,
+    NSGridRowAlignment, NSGridView, NSImage, NSImageName, NSImageNameAddTemplate,
+    NSImageNameRemoveTemplate, NSImageView, NSLineBreakMode, NSPasteboard, NSPasteboardTypeString,
+    NSPopUpButton, NSScreen, NSScrollView, NSSecureTextField, NSStackView, NSTableColumn,
+    NSTableView, NSTableViewColumnAutoresizingStyle, NSTableViewDataSource, NSTableViewDelegate,
+    NSTableViewStyle, NSTextAlignment, NSTextField, NSTextFieldDelegate, NSToolbar,
     NSToolbarDelegate, NSToolbarDisplayMode, NSToolbarItem, NSView, NSWindow, NSWindowDelegate,
     NSWindowStyleMask, NSWindowToolbarStyle, NSWorkspace,
 };
@@ -681,48 +683,81 @@ impl SettingsController {
     /// (RDP, password) layout plus the button bar.
     fn build_connection_pane(&self, mtm: MainThreadMarker, parent: &NSView) -> f64 {
         // ---- connection list (grows with the window) ----
+        // A header names the single-column list (HIG: lists and tables),
+        // aligned with the editor's first section heading.
+        let header = self.label(
+            mtm,
+            parent,
+            rect(16.0, CH - GRID_TOP - 17.0, 190.0, 17.0),
+            "Connections",
+        );
+        header.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
+        header.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinYMargin);
+
+        // Add/remove buttons sit on the list's bottom edge, and the list's
+        // border overlaps their top edge by a point so they read as one unit.
+        let (buttons_y, button_w, button_h) = (24.0, 24.0, 22.0);
+        let list_bottom = buttons_y + button_h - 1.0;
+        let list_top = CH - GRID_TOP - 17.0 - 6.0;
         let scroll = NSScrollView::initWithFrame(
             NSScrollView::alloc(mtm),
-            rect(16.0, BUTTON_BAR, 190.0, CH - BUTTON_BAR - 8.0),
+            rect(16.0, list_bottom, 190.0, list_top - list_bottom),
         );
         scroll.setAutoresizingMask(NSAutoresizingMaskOptions::ViewHeightSizable);
         scroll.setHasVerticalScroller(true);
+        scroll.setAutohidesScrollers(true);
         scroll.setBorderType(NSBorderType::BezelBorder);
-        let table =
-            NSTableView::initWithFrame(NSTableView::alloc(mtm), rect(0.0, 0.0, 188.0, CH - 66.0));
+        // AppKit's inset style supplies the row height, content insets and
+        // selection shape.
+        let table = NSTableView::initWithFrame(NSTableView::alloc(mtm), CGRect::ZERO);
         let column = NSTableColumn::initWithIdentifier(
             NSTableColumn::alloc(mtm),
             &NSString::from_str("name"),
         );
-        column.setWidth(184.0);
         column.setEditable(false);
+        // Long host names keep their start and end (HIG: an ellipsis in the
+        // middle keeps items distinguishable).
+        if let Some(cell) = column.dataCell().downcast_ref::<NSCell>() {
+            cell.setLineBreakMode(NSLineBreakMode::ByTruncatingMiddle);
+        }
         unsafe {
             table.addTableColumn(&column);
             table.setHeaderView(None);
-            table.setRowHeight(20.0);
-            table.setUsesAlternatingRowBackgroundColors(true);
+            table.setStyle(NSTableViewStyle::Inset);
+            table.setColumnAutoresizingStyle(
+                NSTableViewColumnAutoresizingStyle::UniformColumnAutoresizingStyle,
+            );
             table.setDataSource(Some(ProtocolObject::from_ref(self)));
             table.setDelegate(Some(ProtocolObject::from_ref(self)));
         }
         scroll.setDocumentView(Some(&table));
+        // The one column spans the list, so names use the full row width.
+        table.sizeLastColumnToFit();
         parent.addSubview(&scroll);
         *self.ivars().table.borrow_mut() = Some(table);
 
-        // Small square +/− directly under the list (macOS source-list idiom).
-        let _ = self.button_ret(
-            mtm,
-            parent,
-            rect(16.0, 16.0, 36.0, 26.0),
-            "+",
+        let list_button = |image: &NSImageName, x: f64, action: Sel| {
+            let image = NSImage::imageNamed(image).expect("system add/remove image");
+            let b = unsafe {
+                NSButton::buttonWithImage_target_action(&image, Some(self.any()), Some(action), mtm)
+            };
+            b.setBezelStyle(NSBezelStyle::SmallSquare);
+            b.setFrame(rect(x, buttons_y, button_w, button_h));
+            parent.addSubview(&b);
+            b
+        };
+        let add = list_button(
+            unsafe { NSImageNameAddTemplate },
+            16.0,
             sel!(addConnection:),
         );
-        let remove = self.button_ret(
-            mtm,
-            parent,
-            rect(56.0, 16.0, 36.0, 26.0),
-            "−",
+        add.setToolTip(Some(&NSString::from_str("Add a connection")));
+        let remove = list_button(
+            unsafe { NSImageNameRemoveTemplate },
+            16.0 + button_w - 1.0,
             sel!(removeConnection:),
         );
+        remove.setToolTip(Some(&NSString::from_str("Remove the selected connection")));
         remove.setEnabled(false);
         *self.ivars().remove_button.borrow_mut() = Some(remove);
 
