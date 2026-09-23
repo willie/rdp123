@@ -558,7 +558,7 @@ fn nv12_to_yuv420(image: &CVImageBuffer) -> DecoderResult<DecodedYuv420Frame> {
         DecodedYuv420Frame::new(
             nv12.width,
             nv12.height,
-            (nv12.y_plane[..y_stride * height].to_vec(), y_stride),
+            (nv12.y_plane.to_vec(), y_stride),
             (u, chroma_width),
             (v, chroma_width),
         )

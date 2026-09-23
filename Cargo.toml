@@ -162,4 +162,5 @@ ironrdp-graphics = { path = "vendor/ironrdp-graphics" }
 #   length-prefixed NAL units (same detection as upstream PR #1986, open).
 # - YUV is converted as full-range BT.709 instead of limited-range BT.601
 #   (backport of upstream 9542e017, #1923, unreleased as of 0.3.0).
+# - AVC444v2 is decoded (port of the upstream AVC444 change, not yet a PR).
 ironrdp-egfx = { path = "vendor/ironrdp-egfx" }
