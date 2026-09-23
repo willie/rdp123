@@ -576,7 +576,10 @@ impl AppDelegate {
             }
         };
         controller.show(mtm);
-        NSApplication::sharedApplication(mtm).activate();
+        // `activate()` needs macOS 14; the app supports macOS 11.
+        let app = NSApplication::sharedApplication(mtm);
+        #[allow(deprecated)]
+        app.activateIgnoringOtherApps(true);
     }
 
     fn handle_session_event(&self, window_id: u64, event: SessionEvent) {
@@ -694,6 +697,14 @@ fn install_main_menu(mtm: MainThreadMarker) {
     app_menu.addItem(&item(mtm, "Quit RDP123", sel!(terminate:), "q"));
     app_slot.setSubmenu(Some(&app_menu));
     main_menu.addItem(&app_slot);
+
+    // File menu: Close ⌘W for the Settings window. Session windows answer
+    // `performClose:` themselves and send ⌘W to the remote instead.
+    let file_slot = NSMenuItem::new(mtm);
+    let file_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("File"));
+    file_menu.addItem(&item(mtm, "Close", sel!(performClose:), "w"));
+    file_slot.setSubmenu(Some(&file_menu));
+    main_menu.addItem(&file_slot);
 
     // Edit menu: the standard first-responder actions.
     let edit_slot = NSMenuItem::new(mtm);

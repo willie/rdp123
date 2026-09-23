@@ -433,7 +433,8 @@ pub fn confirm_unsaved(mtm: MainThreadMarker, name: &str) -> UnsavedChoice {
         "Your edits will be lost if you don't save them.",
     ));
     alert.addButtonWithTitle(&NSString::from_str("Save"));
-    alert.addButtonWithTitle(&NSString::from_str("Discard"));
+    // NSAlert gives a button titled "Don't Save" its standard ⌘D shortcut.
+    alert.addButtonWithTitle(&NSString::from_str("Don’t Save"));
     alert.addButtonWithTitle(&NSString::from_str("Cancel"));
     match alert.runModal() {
         FIRST_BUTTON => UnsavedChoice::Save,
@@ -449,9 +450,11 @@ pub fn confirm_delete(mtm: MainThreadMarker, name: &str) -> bool {
     alert.setInformativeText(&NSString::from_str(
         "The connection and its saved Keychain password will be removed.",
     ));
-    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    // HIG (Alerts): the default button goes on the trailing side and Cancel
+    // is never the default. The first button added is the trailing default.
     alert.addButtonWithTitle(&NSString::from_str("Delete"));
-    alert.runModal() == 1001
+    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    alert.runModal() == FIRST_BUTTON
 }
 
 /// Show a simple informational / error alert.
