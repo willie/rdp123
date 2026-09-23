@@ -20,13 +20,13 @@ use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
     NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSBezelStyle, NSBorderType,
-    NSBox, NSBoxType, NSButton, NSCell, NSColor, NSControlStateValueOff, NSControlStateValueOn,
+    NSBox, NSBoxType, NSButton, NSColor, NSControlStateValueOff, NSControlStateValueOn,
     NSControlTextEditingDelegate, NSFont, NSGridCell, NSGridCellPlacement, NSGridRow,
     NSGridRowAlignment, NSGridView, NSImage, NSImageName, NSImageNameAddTemplate,
     NSImageNameRemoveTemplate, NSImageScaling, NSImageView, NSLayoutAttribute, NSLineBreakMode,
     NSPasteboard, NSPasteboardTypeString, NSPopUpButton, NSScreen, NSScrollView, NSSecureTextField,
-    NSStackView, NSStackViewDistribution, NSStackViewGravity, NSTableColumn, NSTableView,
-    NSTableViewColumnAutoresizingStyle, NSTableViewDataSource, NSTableViewDelegate,
+    NSStackView, NSStackViewDistribution, NSStackViewGravity, NSTableCellView, NSTableColumn,
+    NSTableView, NSTableViewColumnAutoresizingStyle, NSTableViewDataSource, NSTableViewDelegate,
     NSTableViewStyle, NSTextAlignment, NSTextField, NSTextFieldDelegate, NSToolbar,
     NSToolbarDelegate, NSToolbarDisplayMode, NSToolbarItem, NSUserInterfaceLayoutOrientation,
     NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask, NSWindowToolbarStyle, NSWorkspace,
@@ -207,23 +207,6 @@ define_class!(
             self.ivars().document.borrow().connections.len() as NSInteger
         }
 
-        #[unsafe(method_id(tableView:objectValueForTableColumn:row:))]
-        fn object_value(
-            &self,
-            _t: &NSTableView,
-            _c: &NSTableColumn,
-            row: NSInteger,
-        ) -> Option<Retained<AnyObject>> {
-            self.ivars().document.borrow().connections.get(row as usize).map(|c| {
-                let label = match c.kind {
-                    ConnectionKind::Rdp => c.name.clone(),
-                    ConnectionKind::Ssh => format!("{} (SSH)", c.name),
-                };
-                let s = NSString::from_str(&label);
-                let any: &AnyObject = &s;
-                any.retain()
-            })
-        }
     }
 
     unsafe impl NSControlTextEditingDelegate for SettingsController {
@@ -253,6 +236,16 @@ define_class!(
         #[unsafe(method(tableViewSelectionDidChange:))]
         fn selection_changed(&self, _n: &NSNotification) {
             self.handle_selection_change();
+        }
+
+        #[unsafe(method_id(tableView:viewForTableColumn:row:))]
+        fn view_for_row(
+            &self,
+            table: &NSTableView,
+            _column: Option<&NSTableColumn>,
+            row: NSInteger,
+        ) -> Option<Retained<NSView>> {
+            self.connection_row_view(table, row)
         }
     }
 
@@ -747,23 +740,19 @@ impl SettingsController {
         scroll.setHasVerticalScroller(true);
         scroll.setAutohidesScrollers(true);
         scroll.setBorderType(NSBorderType::BezelBorder);
-        // AppKit's inset style supplies the row height, content insets and
-        // selection shape.
+        // A view-based table (rows are cell views from `connection_row_view`)
+        // in the classic bordered style: AppKit supplies the row height and a
+        // full-width selection bar.
         let table = NSTableView::initWithFrame(NSTableView::alloc(mtm), CGRect::ZERO);
         let column = NSTableColumn::initWithIdentifier(
             NSTableColumn::alloc(mtm),
             &NSString::from_str("name"),
         );
         column.setEditable(false);
-        // Long host names keep their start and end (HIG: an ellipsis in the
-        // middle keeps items distinguishable).
-        if let Some(cell) = column.dataCell().downcast_ref::<NSCell>() {
-            cell.setLineBreakMode(NSLineBreakMode::ByTruncatingMiddle);
-        }
         unsafe {
             table.addTableColumn(&column);
             table.setHeaderView(None);
-            table.setStyle(NSTableViewStyle::Inset);
+            table.setStyle(NSTableViewStyle::FullWidth);
             table.setColumnAutoresizingStyle(
                 NSTableViewColumnAutoresizingStyle::UniformColumnAutoresizingStyle,
             );
@@ -1415,6 +1404,53 @@ impl SettingsController {
     }
 
     // ---------- data flow ----------
+
+    /// A connection-list row: a reused table cell view whose text field is
+    /// centered vertically and filling the cell (the table insets cells from
+    /// the row's edges). Long names keep
+    /// their start and end (HIG: an ellipsis in the middle keeps items
+    /// distinguishable).
+    fn connection_row_view(&self, table: &NSTableView, row: NSInteger) -> Option<Retained<NSView>> {
+        let title = self
+            .ivars()
+            .document
+            .borrow()
+            .connections
+            .get(usize::try_from(row).ok()?)
+            .map(|c| match c.kind {
+                ConnectionKind::Rdp => c.name.clone(),
+                ConnectionKind::Ssh => format!("{} (SSH)", c.name),
+            })?;
+        let identifier = NSString::from_str("connection");
+        let reused = unsafe { table.makeViewWithIdentifier_owner(&identifier, None) }
+            .and_then(|v| v.downcast::<NSTableCellView>().ok());
+        let cell = match reused {
+            Some(cell) => cell,
+            None => {
+                let mtm = self.mtm();
+                let cell = NSTableCellView::new(mtm);
+                let _: () = unsafe { msg_send![&*cell, setIdentifier: &*identifier] };
+                let text = NSTextField::labelWithString(&NSString::from_str(""), mtm);
+                text.setLineBreakMode(NSLineBreakMode::ByTruncatingMiddle);
+                text.setTranslatesAutoresizingMaskIntoConstraints(false);
+                cell.addSubview(&text);
+                unsafe { cell.setTextField(Some(&text)) };
+                for constraint in [
+                    text.leadingAnchor()
+                        .constraintEqualToAnchor(&cell.leadingAnchor()),
+                    text.trailingAnchor()
+                        .constraintEqualToAnchor(&cell.trailingAnchor()),
+                    text.centerYAnchor()
+                        .constraintEqualToAnchor(&cell.centerYAnchor()),
+                ] {
+                    constraint.setActive(true);
+                }
+                cell
+            }
+        };
+        unsafe { cell.textField() }?.setStringValue(&NSString::from_str(&title));
+        Some(cell.into_super())
+    }
 
     fn pane_toolbar_item(&self, identifier: &NSString) -> Option<Retained<NSToolbarItem>> {
         let id = identifier.to_string();
