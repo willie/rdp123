@@ -62,6 +62,7 @@ define_class!(
                                 || action == sel!(cut:)
                                 || action == sel!(copy:)
                                 || action == sel!(selectAll:)
+                                || action == sel!(performClose:)
                     )
             }
         }
@@ -155,6 +156,14 @@ define_class!(
         #[unsafe(method(selectAll:))]
         fn select_all(&self, _sender: Option<&AnyObject>) {
             self.forward_menu_shortcut(A_KEYCODE);
+        }
+
+        /// File ▸ Close (⌘W) reaches the session view before the window, so
+        /// ⌘W goes to the remote (Ctrl+W with Mac shortcuts) rather than
+        /// closing the session. The window's close button still closes it.
+        #[unsafe(method(performClose:))]
+        fn perform_close(&self, _sender: Option<&AnyObject>) {
+            self.forward_menu_shortcut(W_KEYCODE);
         }
 
         #[unsafe(method(mouseDown:))]

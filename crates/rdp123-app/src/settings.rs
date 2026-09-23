@@ -19,10 +19,10 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
-    NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSBezelStyle, NSBorderType,
-    NSBox, NSBoxType, NSButton, NSColor, NSControlStateValueOff, NSControlStateValueOn,
-    NSControlTextEditingDelegate, NSFont, NSGridCell, NSGridCellPlacement, NSGridRow,
-    NSGridRowAlignment, NSGridView, NSImage, NSImageName, NSImageNameAddTemplate,
+    NSAccessibility, NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSBezelStyle,
+    NSBorderType, NSBox, NSBoxType, NSButton, NSColor, NSControlStateValueOff,
+    NSControlStateValueOn, NSControlTextEditingDelegate, NSFont, NSGridCell, NSGridCellPlacement,
+    NSGridRow, NSGridRowAlignment, NSGridView, NSImage, NSImageName, NSImageNameAddTemplate,
     NSImageNameRemoveTemplate, NSImageScaling, NSImageView, NSLayoutAttribute, NSLineBreakMode,
     NSPasteboard, NSPasteboardTypeString, NSPopUpButton, NSScreen, NSScrollView, NSSecureTextField,
     NSStackView, NSStackViewDistribution, NSStackViewGravity, NSTableCellView, NSTableColumn,
@@ -33,8 +33,8 @@ use objc2_app_kit::{
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{
-    NSArray, NSEdgeInsets, NSIndexSet, NSInteger, NSNotification, NSObject, NSObjectProtocol,
-    NSRange, NSString, NSURL,
+    NSArray, NSEdgeInsets, NSIndexSet, NSInteger, NSNotification, NSNumber, NSNumberFormatter,
+    NSObject, NSObjectProtocol, NSRange, NSString, NSURL,
 };
 
 use rdp123_core::{
@@ -509,7 +509,6 @@ impl SettingsController {
         self.select_row(first);
         self.update_visibility();
         if let Some(w) = self.ivars().window.borrow().as_ref() {
-            w.center();
             w.makeKeyAndOrderFront(None);
         }
     }
@@ -529,6 +528,12 @@ impl SettingsController {
             )
         };
         unsafe { window.setReleasedWhenClosed(false) };
+        // Reopen where it was left; center only the first time.
+        let autosave = NSString::from_str("RDP123Settings");
+        if !window.setFrameUsingName(&autosave) {
+            window.center();
+        }
+        window.setFrameAutosaveName(&autosave);
         window.setDelegate(Some(ProtocolObject::from_ref(self)));
         let content = window.contentView().expect("content view");
 
@@ -790,11 +795,13 @@ impl SettingsController {
         };
         let add = list_button(unsafe { NSImageNameAddTemplate }, sel!(addConnection:));
         add.setToolTip(Some(&NSString::from_str("Add a connection")));
+        add.setAccessibilityLabel(Some(&NSString::from_str("Add connection")));
         let remove = list_button(
             unsafe { NSImageNameRemoveTemplate },
             sel!(removeConnection:),
         );
         remove.setToolTip(Some(&NSString::from_str("Remove the selected connection")));
+        remove.setAccessibilityLabel(Some(&NSString::from_str("Remove connection")));
         remove.setEnabled(false);
         let add_remove = NSStackView::stackViewWithViews(
             &NSArray::from_retained_slice(&[
@@ -894,7 +901,14 @@ impl SettingsController {
         let view = |v: &NSView| -> Retained<NSView> { v.retain() };
         let empty = || NSGridCell::emptyContentView(mtm);
         // (label cell, control cell, group, spans both columns, space above)
-        let field = |l: &str, c: &NSView, g| (view(&label(l)), view(c), g, false, 0.0);
+        // VoiceOver reads the row label as the control's name.
+        let field = |l: &str, c: &NSView, g| {
+            c.setAccessibilityLabel(Some(&NSString::from_str(l.trim_end_matches(':'))));
+            (view(&label(l)), view(c), g, false, 0.0)
+        };
+        let accessible = |v: &NSView, name: &str| {
+            v.setAccessibilityLabel(Some(&NSString::from_str(name)));
+        };
         let control = |c: &NSView, g| (empty(), view(c), g, false, 0.0);
         let wide = |v: &NSView, g| (view(v), empty(), g, true, 0.0);
         let heading = |t: &str, g| {
@@ -918,7 +932,19 @@ impl SettingsController {
         let name = text("Office PC", FIELD_W);
         let kind = popup(&["RDP", "SSH"], sel!(typeChanged:), 120.0);
         let host = text("hostname or IP address", FIELD_W);
+        // Whole numbers only, within the same bounds Save checks (HIG: use a
+        // number formatter for numeric data). No grouping separator, so the
+        // text stays parseable.
+        let numeric = |field: &NSTextField, min: u32, max: u32| {
+            let formatter = NSNumberFormatter::new();
+            formatter.setAllowsFloats(false);
+            formatter.setUsesGroupingSeparator(false);
+            formatter.setMinimum(Some(&NSNumber::new_u32(min)));
+            formatter.setMaximum(Some(&NSNumber::new_u32(max)));
+            field.setFormatter(Some(&formatter));
+        };
         let port = text("3389", FIELD_W);
+        numeric(&port, 1, u32::from(u16::MAX));
         let authentication = popup(
             &["Password (NLA)", "Microsoft Entra web"],
             sel!(authenticationChanged:),
@@ -938,6 +964,8 @@ impl SettingsController {
         let res_mode = flexible_popup(&["Fit to window", "Fixed"], sel!(resModeChanged:));
         let res_w = text("1920", 70.0);
         let res_h = text("1080", 70.0);
+        numeric(&res_w, 0, u32::from(u16::MAX));
+        numeric(&res_h, 0, u32::from(u16::MAX));
         // The size belongs to the "Fixed" choice, so it sits on the same row
         // (and is disabled for "Fit to window"). The row is exactly as wide
         // as the other fields; the pop-up takes what the size fields leave.
@@ -951,6 +979,9 @@ impl SettingsController {
             mtm,
         );
         resolution.setDistribution(NSStackViewDistribution::Fill);
+        accessible(&res_mode, "Resolution");
+        accessible(&res_w, "Width");
+        accessible(&res_h, "Height");
         resolution
             .widthAnchor()
             .constraintEqualToConstant(FIELD_W)
@@ -984,7 +1015,9 @@ impl SettingsController {
         );
         let reconnect = checkbox("Automatically reconnect after connection drops");
         let rate = text("", 60.0);
+        numeric(&rate, 0, u32::MAX);
         let rate_row = dependent(&[view(&label("Max attempts/minute:")), view(&rate)]);
+        accessible(&rate, "Max attempts per minute");
         let keep_alive = checkbox("Keep session awake");
         keep_alive.setToolTip(Some(&NSString::from_str(
             "While idle, taps an invisible key so the remote session is not \
@@ -1256,10 +1289,12 @@ impl SettingsController {
             term.setTarget(Some(self.any()));
             term.setAction(Some(sel!(globalChanged:)));
         }
+        term.setAccessibilityLabel(Some(&NSString::from_str("SSH terminal")));
 
         let custom = NSTextField::initWithFrame(NSTextField::alloc(mtm), CGRect::ZERO);
         unsafe { custom.setDelegate(Some(ProtocolObject::from_ref(self))) };
         custom.setPlaceholderString(Some(&NSString::from_str("e.g. wezterm start -- {ssh}")));
+        custom.setAccessibilityLabel(Some(&NSString::from_str("Custom command")));
         custom
             .widthAnchor()
             .constraintEqualToConstant(440.0)
@@ -1630,6 +1665,10 @@ impl SettingsController {
         }
         if let Some(b) = self.ivars().revert_button.borrow().as_ref() {
             b.setEnabled(dirty);
+        }
+        // Unsaved edits show as a dot in the close button.
+        if let Some(w) = self.ivars().window.borrow().as_ref() {
+            w.setDocumentEdited(dirty);
         }
     }
 
