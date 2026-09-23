@@ -63,9 +63,10 @@ use ironrdp_pdu::{PduResult, decode_cursor, decode_err, pdu_other_err};
 use tracing::{debug, trace, warn};
 
 use crate::CHANNEL_NAME;
+use crate::avc444::Yuv444Frame;
 use crate::decode::H264Decoder;
 use crate::pdu::{
-    Avc420BitmapStream, CacheImportReplyPdu, CacheToSurfacePdu, CapabilitiesAdvertisePdu, CapabilitiesV8Flags,
+    Avc420BitmapStream, Avc444BitmapStream, CacheImportReplyPdu, CacheToSurfacePdu, CapabilitiesAdvertisePdu, CapabilitiesV8Flags,
     CapabilitiesV81Flags, CapabilitiesV107Flags, CapabilitySet, Codec1Type, DeleteEncodingContextPdu,
     EvictCacheEntryPdu, FrameAcknowledgePdu, GfxPdu, MapSurfaceToScaledOutputPdu, MapSurfaceToScaledWindowPdu,
     MapSurfaceToWindowPdu, PixelFormat, QueueDepth, RawCapabilitySet, SolidFillPdu, SurfaceToCachePdu,
@@ -220,10 +221,12 @@ pub trait GraphicsPipelineHandler: Send {
     /// The default advertises V10.7 (AVC420+AVC444), V8.1 (AVC420 only),
     /// and V8 (no AVC) as fallback.
     ///
-    /// Note: AVC-capable versions are automatically filtered out at
-    /// advertisement time if no H.264 decoder is configured on the
-    /// [`GraphicsPipelineClient`]. If all returned sets require AVC
-    /// and no decoder is available, a V8-only fallback is used.
+    /// Note: sets are filtered at advertisement time to what the configured
+    /// decoder can handle: AVC-capable sets are dropped without an H.264
+    /// decoder, and AVC444-capable sets are dropped when the decoder doesn't
+    /// return YUV420 planes. If nothing is left, a V8-only fallback is used.
+    /// Only AVC444v2 is decoded; AVC444 (v1 layout) reaches
+    /// [`GraphicsPipelineHandler::on_unhandled_pdu`].
     fn capabilities(&self) -> Vec<CapabilitySet> {
         vec![
             CapabilitySet::V10_7 {
@@ -383,6 +386,9 @@ enum ClientState {
 pub struct GraphicsPipelineClient {
     handler: Box<dyn GraphicsPipelineHandler>,
     h264_decoder: Option<Box<dyn H264Decoder>>,
+    /// Reconstructed YUV444 frame per surface for AVC444, kept between PDUs
+    /// because a PDU may carry only the luma or only the chroma view.
+    avc444_frames: BTreeMap<u16, Yuv444Frame>,
 
     decompressor: zgfx::Decompressor,
     decompressed_buffer: Vec<u8>,
@@ -405,6 +411,7 @@ impl GraphicsPipelineClient {
         Self {
             handler,
             h264_decoder,
+            avc444_frames: BTreeMap::new(),
             decompressor: zgfx::Decompressor::new(),
             decompressed_buffer: Vec::new(),
             state: ClientState::WaitingForConfirm,
@@ -632,6 +639,7 @@ impl GraphicsPipelineClient {
         if let Some(ref mut decoder) = self.h264_decoder {
             decoder.reset();
         }
+        self.avc444_frames.clear();
 
         debug!(width, height, "Graphics reset");
         self.handler.on_reset_graphics(width, height);
@@ -659,6 +667,7 @@ impl GraphicsPipelineClient {
     }
 
     fn handle_delete_surface(&mut self, surface_id: u16) {
+        self.avc444_frames.remove(&surface_id);
         if self.surfaces.remove(&surface_id).is_some() {
             debug!(surface_id, "Surface deleted");
             self.handler.on_surface_deleted(surface_id);
@@ -716,8 +725,11 @@ impl GraphicsPipelineClient {
             Codec1Type::Avc420 => {
                 self.decode_avc420(pdu.surface_id, &pdu.destination_rectangle, &pdu.bitmap_data)?;
             }
-            Codec1Type::Avc444 | Codec1Type::Avc444v2 => {
-                debug!("AVC444 codec not yet implemented, forwarding to handler");
+            Codec1Type::Avc444v2 => {
+                self.decode_avc444v2(pdu.surface_id, &pdu.destination_rectangle, &pdu.bitmap_data)?;
+            }
+            Codec1Type::Avc444 => {
+                debug!("AVC444 (v1 layout) not yet implemented, forwarding to handler");
                 self.handler.on_unhandled_pdu(&GfxPdu::WireToSurface1(pdu));
             }
             Codec1Type::Uncompressed => {
@@ -777,6 +789,116 @@ impl GraphicsPipelineClient {
         Ok(())
     }
 
+    /// Decode an AVC444v2 update ([MS-RDPEGFX] 2.2.4.6).
+    ///
+    /// Both views go through the one H.264 decoder in order, as MS-RDPEGFX
+    /// 2.2.4.5 requires ("decoded by a single MPEG-4 AVC/H.264 decoder as one
+    /// stream"), and are combined into the surface's persistent YUV444 frame.
+    fn decode_avc444v2(
+        &mut self,
+        surface_id: u16,
+        dest_rect: &ExclusiveRectangle,
+        bitmap_data: &[u8],
+    ) -> PduResult<()> {
+        let mut cursor = ReadCursor::new(bitmap_data);
+        let stream = Avc444BitmapStream::decode(&mut cursor).map_err(|e| decode_err!(e))?;
+
+        let Some(ref mut decoder) = self.h264_decoder else {
+            debug!("No H.264 decoder configured, skipping AVC444 frame");
+            return Ok(());
+        };
+
+        // Backport of IronRDP e0727394 (#1788): region rectangles are
+        // exclusive on the wire, although 0.3.0 decodes them as inclusive.
+        let regions = |view: &Avc420BitmapStream<'_>| -> Vec<ExclusiveRectangle> {
+            view.rectangles
+                .iter()
+                .map(|r| ExclusiveRectangle {
+                    left: r.left,
+                    top: r.top,
+                    right: r.right,
+                    bottom: r.bottom,
+                })
+                .collect()
+        };
+
+        // LC 0: luma then chroma; 1: luma only; 2: chroma only, in stream1.
+        let (luma, chroma) = if stream.encoding == crate::pdu::Encoding::LUMA_AND_CHROMA {
+            (Some(&stream.stream1), stream.stream2.as_ref())
+        } else if stream.encoding == crate::pdu::Encoding::LUMA {
+            (Some(&stream.stream1), None)
+        } else {
+            (None, Some(&stream.stream1))
+        };
+        let luma = luma
+            .map(|view| decoder.decode_yuv420(view.data).map(|frame| (frame, regions(view))))
+            .transpose()
+            .map_err(|e| pdu_other_err!("H.264 decode (AVC444 luma)", source: e))?;
+        let chroma = chroma
+            .map(|view| decoder.decode_yuv420(view.data).map(|frame| (frame, regions(view))))
+            .transpose()
+            .map_err(|e| pdu_other_err!("H.264 decode (AVC444 chroma)", source: e))?;
+
+        let Some((width, height)) = luma
+            .as_ref()
+            .or(chroma.as_ref())
+            .map(|(frame, _)| (frame.width(), frame.height()))
+        else {
+            return Err(pdu_other_err!("AVC444 update without a view"));
+        };
+        let (width, height) = (
+            usize::try_from(width).map_err(|_| pdu_other_err!("AVC444 frame too wide"))?,
+            usize::try_from(height).map_err(|_| pdu_other_err!("AVC444 frame too tall"))?,
+        );
+
+        if self
+            .avc444_frames
+            .get(&surface_id)
+            .is_none_or(|frame| frame.width() != width || frame.height() != height)
+        {
+            let frame = Yuv444Frame::new(width, height).map_err(|e| pdu_other_err!("AVC444 frame size", source: e))?;
+            self.avc444_frames.insert(surface_id, frame);
+        }
+        let frame = self
+            .avc444_frames
+            .get_mut(&surface_id)
+            .expect("AVC444 frame inserted above");
+        if let Some((view, regions)) = &luma {
+            frame
+                .apply_main_view(&view.planes(), regions)
+                .map_err(|e| pdu_other_err!("AVC444 luma view", source: e))?;
+        }
+        if let Some((view, regions)) = &chroma {
+            frame
+                .apply_auxiliary_view_v2(&view.planes(), regions)
+                .map_err(|e| pdu_other_err!("AVC444 chroma view", source: e))?;
+        }
+
+        let dest_width = dest_rect.width();
+        let dest_height = dest_rect.height();
+        if width < usize::from(dest_width) || height < usize::from(dest_height) {
+            warn!(
+                width,
+                height, dest_width, dest_height, "decoded frame smaller than destination rectangle"
+            );
+            return Err(pdu_other_err!("decoded frame smaller than destination rectangle"));
+        }
+        let data = frame
+            .to_rgba(usize::from(dest_width), usize::from(dest_height))
+            .map_err(|e| pdu_other_err!("AVC444 color conversion", source: e))?;
+
+        let update = BitmapUpdate {
+            surface_id,
+            destination_rectangle: dest_rect.clone(),
+            codec_id: Codec1Type::Avc444v2,
+            data,
+            width: dest_width,
+            height: dest_height,
+        };
+        self.handler.on_bitmap_updated(&update);
+        Ok(())
+    }
+
     fn handle_uncompressed(&mut self, pdu: crate::pdu::WireToSurface1Pdu) {
         let dest_width = pdu.destination_rectangle.width();
         let dest_height = pdu.destination_rectangle.height();
@@ -827,27 +949,29 @@ impl DvcProcessor for GraphicsPipelineClient {
     }
 
     fn start(&mut self, _channel_id: u32) -> PduResult<Vec<DvcMessage>> {
-        let caps = if self.h264_decoder.is_some() {
-            self.handler.capabilities()
+        // Advertise only what can be decoded: AVC420 needs an H.264 decoder,
+        // and AVC444 needs one that returns YUV420 planes for reconstruction.
+        let (can_avc420, can_avc444) = match &self.h264_decoder {
+            Some(decoder) => (true, decoder.supports_yuv420()),
+            None => (false, false),
+        };
+        let filtered: Vec<CapabilitySet> = self
+            .handler
+            .capabilities()
+            .into_iter()
+            .filter(|cap| {
+                let codecs = CodecCapabilities::from_capability_set(cap);
+                (can_avc420 || !codecs.avc420) && (can_avc444 || !codecs.avc444)
+            })
+            .collect();
+        let caps = if filtered.is_empty() {
+            // Every handler cap needed a codec we can't decode; fall back to V8-only
+            debug!("No capability set matches the configured decoder; falling back to V8");
+            vec![CapabilitySet::V8 {
+                flags: CapabilitiesV8Flags::SMALL_CACHE,
+            }]
         } else {
-            // No H.264 decoder: filter out capability sets that imply AVC support.
-            // Only keep sets that work without a decoder (V8 without AVC flags).
-            let filtered: Vec<CapabilitySet> = self
-                .handler
-                .capabilities()
-                .into_iter()
-                .filter(|cap| !CodecCapabilities::from_capability_set(cap).avc420)
-                .collect();
-
-            if filtered.is_empty() {
-                // All handler caps required AVC; fall back to V8-only
-                debug!("No H.264 decoder and all capabilities require AVC; falling back to V8");
-                vec![CapabilitySet::V8 {
-                    flags: CapabilitiesV8Flags::SMALL_CACHE,
-                }]
-            } else {
-                filtered
-            }
+            filtered
         };
 
         let pdu = GfxPdu::CapabilitiesAdvertise(CapabilitiesAdvertisePdu::from_typed(&caps));

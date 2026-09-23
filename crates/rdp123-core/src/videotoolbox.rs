@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 
 use block2::RcBlock;
 use ironrdp_egfx::decode::{
-    DecodedFrame, DecoderError, DecoderResult, H264Decoder, OpenH264Decoder,
+    DecodedFrame, DecodedYuv420Frame, DecoderError, DecoderResult, H264Decoder, OpenH264Decoder,
 };
 use objc2_core_foundation::{
     kCFAllocatorNull, CFBoolean, CFDictionary, CFRetained, CFString, CFType,
@@ -133,8 +133,57 @@ impl VideoToolboxDecoder {
         Ok(parameter_sets_changed)
     }
 
+    /// Decode `data`, returning the picture through `convert`, or through
+    /// `fallback` once VideoToolbox has been given up on.
+    fn decode_with<T>(
+        &mut self,
+        data: &[u8],
+        convert: fn(&CVImageBuffer) -> DecoderResult<T>,
+        fallback: fn(&mut OpenH264Decoder, &[u8]) -> DecoderResult<T>,
+    ) -> DecoderResult<T> {
+        if let Some(decoder) = &mut self.fallback {
+            return fallback(decoder, data);
+        }
+
+        let parameter_sets_changed = self.ingest(data)?;
+        if self.sps.is_empty() || self.pps.is_empty() {
+            return Err(DecoderError::msg("no SPS/PPS received yet"));
+        }
+        if parameter_sets_changed || self.session.is_none() {
+            if let Err(e) = self.open_session() {
+                return self.switch_to_openh264(data, &e, fallback);
+            }
+        }
+        if self.sample.is_empty() {
+            return Err(DecoderError::msg("no slice data in frame"));
+        }
+
+        match self.decode_sample(convert) {
+            Ok(frame) => Ok(frame),
+            Err(Failure::NoPicture(e)) => Err(e),
+            Err(Failure::Unusable(e)) => self.switch_to_openh264(data, &e, fallback),
+            Err(Failure::Decode(e)) => {
+                // The system can invalidate a session (sleep/wake, GPU change);
+                // rebuild it from the stored parameter sets and retry once.
+                tracing::warn!("egfx: VideoToolbox decode failed ({e}); rebuilding the session");
+                self.drop_session();
+                if let Err(e) = self.open_session() {
+                    return self.switch_to_openh264(data, &e, fallback);
+                }
+                match self.decode_sample(convert) {
+                    Ok(frame) => Ok(frame),
+                    Err(Failure::Unusable(e)) => self.switch_to_openh264(data, &e, fallback),
+                    Err(Failure::NoPicture(e) | Failure::Decode(e)) => Err(e),
+                }
+            }
+        }
+    }
+
     /// Decode `self.sample` with the open session.
-    fn decode_sample(&mut self) -> Result<DecodedFrame, Failure> {
+    fn decode_sample<T>(
+        &mut self,
+        convert: fn(&CVImageBuffer) -> DecoderResult<T>,
+    ) -> Result<T, Failure> {
         let session = self.session.as_ref().expect("session is open");
         let format = self.format.as_ref().expect("session is open");
 
@@ -227,17 +276,18 @@ impl VideoToolboxDecoder {
                 ))))
             }
         };
-        nv12_to_rgba(&image).map_err(Failure::Unusable)
+        convert(&image).map_err(Failure::Unusable)
     }
 
     /// Give up on VideoToolbox for the rest of the connection. OpenH264 is
     /// handed the stored SPS/PPS ahead of this access unit, since the server
     /// only resends them with the next keyframe.
-    fn switch_to_openh264(
+    fn switch_to_openh264<T>(
         &mut self,
         data: &[u8],
         cause: &DecoderError,
-    ) -> DecoderResult<DecodedFrame> {
+        decode: fn(&mut OpenH264Decoder, &[u8]) -> DecoderResult<T>,
+    ) -> DecoderResult<T> {
         tracing::warn!(
             "egfx: VideoToolbox can't decode this stream ({cause}); switching to OpenH264"
         );
@@ -252,7 +302,7 @@ impl VideoToolboxDecoder {
         }
         self.close_session();
         let fallback = self.fallback.insert(OpenH264Decoder::new()?);
-        fallback.decode(&primed)
+        decode(fallback, &primed)
     }
 
     fn open_session(&mut self) -> DecoderResult<()> {
@@ -347,42 +397,7 @@ impl Drop for VideoToolboxDecoder {
 
 impl H264Decoder for VideoToolboxDecoder {
     fn decode(&mut self, data: &[u8]) -> DecoderResult<DecodedFrame> {
-        if let Some(fallback) = &mut self.fallback {
-            return fallback.decode(data);
-        }
-
-        let parameter_sets_changed = self.ingest(data)?;
-        if self.sps.is_empty() || self.pps.is_empty() {
-            return Err(DecoderError::msg("no SPS/PPS received yet"));
-        }
-        if parameter_sets_changed || self.session.is_none() {
-            if let Err(e) = self.open_session() {
-                return self.switch_to_openh264(data, &e);
-            }
-        }
-        if self.sample.is_empty() {
-            return Err(DecoderError::msg("no slice data in frame"));
-        }
-
-        match self.decode_sample() {
-            Ok(frame) => Ok(frame),
-            Err(Failure::NoPicture(e)) => Err(e),
-            Err(Failure::Unusable(e)) => self.switch_to_openh264(data, &e),
-            Err(Failure::Decode(e)) => {
-                // The system can invalidate a session (sleep/wake, GPU change);
-                // rebuild it from the stored parameter sets and retry once.
-                tracing::warn!("egfx: VideoToolbox decode failed ({e}); rebuilding the session");
-                self.drop_session();
-                if let Err(e) = self.open_session() {
-                    return self.switch_to_openh264(data, &e);
-                }
-                match self.decode_sample() {
-                    Ok(frame) => Ok(frame),
-                    Err(Failure::Unusable(e)) => self.switch_to_openh264(data, &e),
-                    Err(Failure::NoPicture(e) | Failure::Decode(e)) => Err(e),
-                }
-            }
-        }
+        self.decode_with(data, nv12_to_rgba, OpenH264Decoder::decode)
     }
 
     fn reset(&mut self) {
@@ -390,6 +405,14 @@ impl H264Decoder for VideoToolboxDecoder {
         if let Some(fallback) = &mut self.fallback {
             fallback.reset();
         }
+    }
+
+    fn supports_yuv420(&self) -> bool {
+        true
+    }
+
+    fn decode_yuv420(&mut self, data: &[u8]) -> DecoderResult<DecodedYuv420Frame> {
+        self.decode_with(data, nv12_to_yuv420, OpenH264Decoder::decode_yuv420)
     }
 }
 
@@ -501,6 +524,52 @@ fn is_length_prefixed(data: &[u8]) -> bool {
 /// Convert a bi-planar 4:2:0 pixel buffer to RGBA, reading the samples as
 /// full-range BT.709 whatever range the buffer is labelled with.
 fn nv12_to_rgba(image: &CVImageBuffer) -> DecoderResult<DecodedFrame> {
+    with_nv12(image, |nv12| {
+        let mut rgba = vec![0u8; nv12.width as usize * nv12.height as usize * 4];
+        yuv::yuv_nv12_to_rgba(
+            nv12,
+            &mut rgba,
+            nv12.width * 4,
+            yuv::YuvRange::Full,
+            yuv::YuvStandardMatrix::Bt709,
+            yuv::YuvConversionMode::Balanced,
+        )
+        .map_err(|e| DecoderError::new("failed to convert NV12 to RGBA", e))?;
+        Ok(DecodedFrame::new(rgba, nv12.width, nv12.height))
+    })
+}
+
+/// Split a bi-planar 4:2:0 pixel buffer into separate Y, U and V planes,
+/// samples unchanged.
+fn nv12_to_yuv420(image: &CVImageBuffer) -> DecoderResult<DecodedYuv420Frame> {
+    with_nv12(image, |nv12| {
+        let (width, height) = (nv12.width as usize, nv12.height as usize);
+        let (chroma_width, chroma_height) = (width.div_ceil(2), height.div_ceil(2));
+        let y_stride = nv12.y_stride as usize;
+        let uv_stride = nv12.uv_stride as usize;
+        let mut u = Vec::with_capacity(chroma_width * chroma_height);
+        let mut v = Vec::with_capacity(chroma_width * chroma_height);
+        for row in nv12.uv_plane.chunks(uv_stride).take(chroma_height) {
+            for pair in row[..chroma_width * 2].as_chunks::<2>().0 {
+                u.push(pair[0]);
+                v.push(pair[1]);
+            }
+        }
+        DecodedYuv420Frame::new(
+            nv12.width,
+            nv12.height,
+            (nv12.y_plane[..y_stride * height].to_vec(), y_stride),
+            (u, chroma_width),
+            (v, chroma_width),
+        )
+    })
+}
+
+/// Lock a bi-planar 4:2:0 pixel buffer and pass its planes to `f`.
+fn with_nv12<T>(
+    image: &CVImageBuffer,
+    f: impl FnOnce(&yuv::YuvBiPlanarImage<'_, u8>) -> DecoderResult<T>,
+) -> DecoderResult<T> {
     let format = CVPixelBufferGetPixelFormatType(image);
     if format != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
         && format != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
@@ -537,24 +606,14 @@ fn nv12_to_rgba(image: &CVImageBuffer) -> DecoderResult<DecodedFrame> {
         let uv_plane =
             unsafe { std::slice::from_raw_parts(uv_ptr, uv_stride * height.div_ceil(2)) };
 
-        let mut rgba = vec![0u8; width * height * 4];
-        yuv::yuv_nv12_to_rgba(
-            &yuv::YuvBiPlanarImage {
-                y_plane,
-                y_stride: y_stride as u32,
-                uv_plane,
-                uv_stride: uv_stride as u32,
-                width: w32,
-                height: h32,
-            },
-            &mut rgba,
-            w32 * 4,
-            yuv::YuvRange::Full,
-            yuv::YuvStandardMatrix::Bt709,
-            yuv::YuvConversionMode::Balanced,
-        )
-        .map_err(|e| DecoderError::new("failed to convert NV12 to RGBA", e))?;
-        Ok(DecodedFrame::new(rgba, w32, h32))
+        f(&yuv::YuvBiPlanarImage {
+            y_plane,
+            y_stride: y_stride as u32,
+            uv_plane,
+            uv_stride: uv_stride as u32,
+            width: w32,
+            height: h32,
+        })
     })();
     unsafe { CVPixelBufferUnlockBaseAddress(image, CVPixelBufferLockFlags::ReadOnly) };
     result
@@ -611,6 +670,50 @@ mod tests {
             assert!(vt.fallback.is_none(), "frame {n} fell back to OpenH264");
             let diff = max_difference(&got, &want);
             assert!(diff <= 2, "frame {n}: max channel difference {diff}");
+        }
+    }
+
+    #[test]
+    fn yuv420_matches_openh264_exactly() {
+        // H.264 decoding is bit-exact and neither path converts the samples.
+        let mut vt = VideoToolboxDecoder::new();
+        let mut reference = OpenH264Decoder::new().expect("OpenH264");
+        for (n, frame) in encode_frames(6).iter().enumerate() {
+            let got = vt.decode_yuv420(frame).expect("VideoToolbox decode");
+            let want = reference.decode_yuv420(frame).expect("OpenH264 decode");
+            assert!(vt.fallback.is_none(), "frame {n} fell back to OpenH264");
+            assert_eq!((got.width(), got.height()), (W as u32, H as u32));
+            assert_eq!((want.width(), want.height()), (W as u32, H as u32));
+            let (got, want) = (got.planes(), want.planes());
+            for (name, got, got_stride, want, want_stride, width, rows) in [
+                ("Y", got.y, got.y_stride, want.y, want.y_stride, W, H),
+                (
+                    "U",
+                    got.u,
+                    got.u_stride,
+                    want.u,
+                    want.u_stride,
+                    W / 2,
+                    H / 2,
+                ),
+                (
+                    "V",
+                    got.v,
+                    got.v_stride,
+                    want.v,
+                    want.v_stride,
+                    W / 2,
+                    H / 2,
+                ),
+            ] {
+                for row in 0..rows {
+                    assert_eq!(
+                        got[row * got_stride..][..width],
+                        want[row * want_stride..][..width],
+                        "frame {n}: {name} row {row}"
+                    );
+                }
+            }
         }
     }
 

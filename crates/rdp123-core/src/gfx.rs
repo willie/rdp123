@@ -18,9 +18,9 @@ use ironrdp::pdu::codecs::rfx::progressive::{
 use ironrdp::pdu::geometry::{ExclusiveRectangle, Rectangle as _};
 use ironrdp_egfx::client::{BitmapUpdate, GraphicsPipelineHandler, Surface};
 use ironrdp_egfx::pdu::{
-    CacheToSurfacePdu, CapabilitiesV81Flags, CapabilitiesV8Flags, CapabilitySet, Codec1Type, Color,
-    EvictCacheEntryPdu, GfxPdu, MapSurfaceToScaledOutputPdu, SolidFillPdu, SurfaceToCachePdu,
-    SurfaceToSurfacePdu, WireToSurface1Pdu, WireToSurface2Pdu,
+    CacheToSurfacePdu, CapabilitiesV107Flags, CapabilitiesV81Flags, CapabilitiesV8Flags,
+    CapabilitySet, Codec1Type, Color, EvictCacheEntryPdu, GfxPdu, MapSurfaceToScaledOutputPdu,
+    SolidFillPdu, SurfaceToCachePdu, SurfaceToSurfacePdu, WireToSurface1Pdu, WireToSurface2Pdu,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -545,14 +545,16 @@ impl GfxHandler {
 }
 
 impl GraphicsPipelineHandler for GfxHandler {
-    /// Advertise only capability sets whose codecs we can fully decode.
-    ///
-    /// The default advertises V10.7, which tells the server it may use
-    /// AVC444 — we can only decode AVC420, so those regions would silently
-    /// never paint. V8.1 keeps RemoteFX Progressive, ClearCodec, planar and
-    /// AVC420; V8 is the no-AVC fallback.
+    /// V10.7 lets the server use AVC444, which the vendored `ironrdp-egfx`
+    /// decodes in its v2 layout (the one GNOME Remote Desktop sends); the
+    /// client drops the set if the H.264 decoder can't return YUV420 planes.
+    /// V8.1 keeps RemoteFX Progressive, ClearCodec, planar and AVC420; V8 is
+    /// the no-AVC fallback.
     fn capabilities(&self) -> Vec<CapabilitySet> {
         vec![
+            CapabilitySet::V10_7 {
+                flags: CapabilitiesV107Flags::SMALL_CACHE,
+            },
             CapabilitySet::V8_1 {
                 flags: CapabilitiesV81Flags::AVC420_ENABLED | CapabilitiesV81Flags::SMALL_CACHE,
             },
