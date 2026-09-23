@@ -103,9 +103,17 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
-# ironrdp-connector with one addition: a `support_gfx` Config flag that
-# advertises RNS_UD_CS_SUPPORT_DYNVC_GFX_PROTOCOL (required for the server to
-# offer the EGFX graphics pipeline; upstream has no way to set it yet).
+# ironrdp-connector with two additions:
+# - a `support_gfx` Config flag that advertises
+#   RNS_UD_CS_SUPPORT_DYNVC_GFX_PROTOCOL (required for the server to offer the
+#   EGFX graphics pipeline; upstream added this in 5bdb6798, #1237, unreleased
+#   as of 0.10.0).
+# - a reply to the connect-time Bandwidth Measure Stop, backported from
+#   upstream 6a499fae (#1530) and 36a848e0 (#1559), unreleased as of 0.10.0.
+#   Servers built on FreeRDP's server library, such as GNOME Remote Desktop,
+#   wait for this reply, so without it the connection stalls after sign-in.
+#   Upstream times the window from arrival times the driver passes in; 0.10.0's
+#   driver has no such input, so this uses the time each PDU is processed.
 [patch.crates-io]
 ironrdp-connector = { path = "vendor/ironrdp-connector" }
 # ironrdp-graphics: fixes RemoteFX Progressive context lifetime, signed

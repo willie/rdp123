@@ -2,6 +2,7 @@ use core::mem;
 use core::net::SocketAddr;
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::time::Instant;
 
 use ironrdp_core::{Encode, WriteBuf, decode, encode_vec};
 use ironrdp_pdu::x224::X224;
@@ -142,6 +143,10 @@ pub struct ClientConnector {
     pub static_channels: StaticChannelSet,
     /// MCS message channel ID assigned by the server, once negotiated.
     pub message_channel_id: Option<u16>,
+    /// When the connect-time Bandwidth Measure Start was processed, while a window is open.
+    connect_time_bw_started_at: Option<Instant>,
+    /// Bytes counted toward the open connect-time bandwidth window.
+    connect_time_bw_bytes: u32,
 }
 
 impl ClientConnector {
@@ -152,6 +157,8 @@ impl ClientConnector {
             client_addr,
             static_channels: StaticChannelSet::new(),
             message_channel_id: None,
+            connect_time_bw_started_at: None,
+            connect_time_bw_bytes: 0,
         }
     }
 
@@ -596,7 +603,7 @@ impl Sequence for ClientConnector {
 
                 if let Some((message_channel_id, data)) = message_channel_pdu {
                     if let Ok(autodetect) = decode::<rdp::autodetect::AutoDetectReqPdu>(&data.user_data) {
-                        let written = respond_to_connect_time_autodetect(
+                        let written = self.respond_to_connect_time_autodetect(
                             autodetect.request,
                             message_channel_id,
                             user_channel_id,
@@ -778,29 +785,99 @@ pub fn encode_send_data_request<T: Encode>(
     Ok(written)
 }
 
-fn respond_to_connect_time_autodetect(
-    request: rdp::autodetect::AutoDetectRequest,
-    message_channel_id: u16,
-    user_channel_id: u16,
-    output: &mut WriteBuf,
-) -> ConnectorResult<Written> {
-    use ironrdp_pdu::rdp::autodetect::{AutoDetectRequest, AutoDetectResponse, AutoDetectRspPdu};
+/// Size of the Bandwidth Measure header fields ([MS-RDPBCGR] 3.2.5.14 counts
+/// payloadLength plus these 8 bytes toward the Byte Count).
+const AUTO_DETECT_HEADER_LEN: u32 = 8;
 
-    match request {
-        AutoDetectRequest::RttRequest { sequence_number, .. } => {
-            let response = AutoDetectRspPdu::new(AutoDetectResponse::RttResponse { sequence_number });
-            let written = encode_send_data_request(user_channel_id, message_channel_id, &response, output)?;
-            Written::from_size(written)
+/// Reported as timeDelta for an untimed or sub-millisecond window; servers
+/// compute byteCount * 8 / timeDelta ([MS-RDPBCGR] 3.3.5.14), so never zero.
+const UNMEASURABLE_INTERVAL_MS: u32 = 1;
+
+fn counted_len(payload_len: usize) -> u32 {
+    u32::try_from(payload_len)
+        .unwrap_or(u32::MAX)
+        .saturating_add(AUTO_DETECT_HEADER_LEN)
+}
+
+impl ClientConnector {
+    // Backport of upstream IronRDP 36a848e0 (#1559), unreleased as of 0.10.0.
+    // Upstream stamps each frame's arrival time in the driver; this uses the
+    // time the connector processes it.
+    fn respond_to_connect_time_autodetect(
+        &mut self,
+        request: rdp::autodetect::AutoDetectRequest,
+        message_channel_id: u16,
+        user_channel_id: u16,
+        output: &mut WriteBuf,
+    ) -> ConnectorResult<Written> {
+        use ironrdp_pdu::rdp::autodetect::{
+            AutoDetectRequest, AutoDetectResponse, AutoDetectRspPdu, BW_RESULTS_CONNECT_TIME, BW_START_CONNECT_TIME,
+            BW_STOP_CONNECT_TIME,
+        };
+
+        match request {
+            AutoDetectRequest::RttRequest { sequence_number, .. } => {
+                let response = AutoDetectRspPdu::new(AutoDetectResponse::RttResponse { sequence_number });
+                let written = encode_send_data_request(user_channel_id, message_channel_id, &response, output)?;
+                Written::from_size(written)
+            }
+            // Start opens the measurement window ([MS-RDPBCGR] 2.2.14.1.2); no reply is due.
+            AutoDetectRequest::BandwidthMeasureStart { request_type, .. } if request_type == BW_START_CONNECT_TIME => {
+                self.connect_time_bw_started_at = Some(Instant::now());
+                self.connect_time_bw_bytes = 0;
+                Ok(Written::Nothing)
+            }
+            // Payload bytes are counted toward the window ([MS-RDPBCGR] 2.2.14.1.3).
+            AutoDetectRequest::BandwidthMeasurePayload { payload, .. } => {
+                if self.connect_time_bw_started_at.is_some() {
+                    self.connect_time_bw_bytes = self.connect_time_bw_bytes.saturating_add(counted_len(payload.len()));
+                }
+                Ok(Written::Nothing)
+            }
+            // The connect-time Stop requires a Bandwidth Measure Results reply
+            // ([MS-RDPBCGR] 2.2.14.2.2). FreeRDP-based servers, including GNOME
+            // Remote Desktop, wait for it and never proceed to licensing without it.
+            AutoDetectRequest::BandwidthMeasureStop {
+                sequence_number,
+                request_type,
+                payload,
+            } if request_type == BW_STOP_CONNECT_TIME => {
+                let stop_bytes = payload.as_ref().map_or(0, |p| counted_len(p.len()));
+                let (time_delta_ms, byte_count) = match self.connect_time_bw_started_at.take() {
+                    Some(started_at) => (
+                        u32::try_from(started_at.elapsed().as_millis())
+                            .unwrap_or(u32::MAX)
+                            .max(UNMEASURABLE_INTERVAL_MS),
+                        self.connect_time_bw_bytes.saturating_add(stop_bytes),
+                    ),
+                    None => (UNMEASURABLE_INTERVAL_MS, stop_bytes),
+                };
+                self.connect_time_bw_bytes = 0;
+
+                debug!(time_delta_ms, byte_count, "Send connect-time Bandwidth Measure Results");
+                let response = AutoDetectRspPdu::new(AutoDetectResponse::BandwidthMeasureResults {
+                    sequence_number,
+                    response_type: BW_RESULTS_CONNECT_TIME,
+                    time_delta_ms,
+                    byte_count,
+                });
+                let written = encode_send_data_request(user_channel_id, message_channel_id, &response, output)?;
+                Written::from_size(written)
+            }
+            AutoDetectRequest::BandwidthMeasureStop {
+                sequence_number,
+                request_type,
+                ..
+            } => {
+                warn!(
+                    sequence_number,
+                    request_type, "Unexpected Bandwidth Measure Stop requestType during connect-time auto-detection"
+                );
+                Ok(Written::Nothing)
+            }
+            // The Network Characteristics Result is informational; nothing to send.
+            _ => Ok(Written::Nothing),
         }
-        // Only RTT is answered at connect time. A connect-time Bandwidth Measure
-        // Stop ([MS-RDPBCGR] 2.2.14.1.4) is defined to warrant a Bandwidth Measure
-        // Results reply, and the Network Characteristics Result is informational.
-        // We deliberately send neither: connect-time auto-detect is informational
-        // and the server proceeds to licensing whether or not it receives them, so
-        // skipping them does not stall the sequence. Full connect-time bandwidth
-        // measurement (replying to Bandwidth Measure Stop with Bandwidth Measure
-        // Results) is left for a follow-up.
-        _ => Ok(Written::Nothing),
     }
 }
 
