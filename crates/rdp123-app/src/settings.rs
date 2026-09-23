@@ -153,6 +153,7 @@ pub struct SettingsIvars {
     terminal: Popup,
     custom: Field,
     swap_cmd_alt: Check,
+    mac_shortcuts: Check,
     external_stt_paste: Check,
     /// Launch-at-login. Not persisted in the document: the checkbox mirrors
     /// the system's `SMAppService` status.
@@ -1044,6 +1045,16 @@ impl SettingsController {
             rect(gx, y, 640.0, ROW_H),
             "Matches the PC key layout: the key next to the space bar is Alt.",
         );
+        y -= PITCH;
+        let mac_shortcuts = self.checkbox_fit(
+            mtm,
+            parent,
+            gfield,
+            y,
+            "Use Mac shortcuts in RDP sessions (⌘C, ⌘V, ⌘X, ⌘A, ⌘Z, ⌘F, ⌘W send Ctrl)",
+            sel!(globalChanged:),
+        );
+        *self.ivars().mac_shortcuts.borrow_mut() = Some(mac_shortcuts);
         y -= PITCH + 10.0;
 
         let stt_header = self.label(mtm, parent, rect(gx, y, 460.0, 20.0), "Speech to text");
@@ -1598,6 +1609,8 @@ impl SettingsController {
         self.set_field(&iv.custom, &custom);
         let swap_cmd_alt = iv.document.borrow().settings.swap_cmd_alt;
         self.set_check(&iv.swap_cmd_alt, swap_cmd_alt);
+        let mac_shortcuts = iv.document.borrow().settings.mac_shortcuts;
+        self.set_check(&iv.mac_shortcuts, mac_shortcuts);
         let external_stt_paste = iv.document.borrow().settings.external_stt_paste;
         self.set_check(&iv.external_stt_paste, external_stt_paste);
         // Reflect the system's login-item state, not a stored flag.
@@ -1834,8 +1847,10 @@ impl SettingsController {
             Some(custom)
         };
         document.settings.swap_cmd_alt = self.check_on(&self.ivars().swap_cmd_alt);
+        document.settings.mac_shortcuts = self.check_on(&self.ivars().mac_shortcuts);
         document.settings.external_stt_paste = self.check_on(&self.ivars().external_stt_paste);
         if self.save_document(&document) {
+            crate::delegate::set_mac_shortcuts_enabled(document.settings.mac_shortcuts);
             crate::delegate::set_external_stt_paste_enabled(document.settings.external_stt_paste);
             *self.ivars().document.borrow_mut() = document;
         }

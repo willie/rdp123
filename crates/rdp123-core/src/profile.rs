@@ -406,7 +406,7 @@ impl TerminalKind {
 }
 
 /// Global settings.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default)]
     pub terminal: TerminalKind,
@@ -414,6 +414,10 @@ pub struct Settings {
     /// to the space bar) and ⌥ sends the Windows key. Off by default.
     #[serde(default)]
     pub swap_cmd_alt: bool,
+    /// Send ⌘C, ⌘V, ⌘X, ⌘A, ⌘Z, ⌘F and ⌘W as their Ctrl shortcuts inside RDP
+    /// sessions. Other ⌘ combinations keep the Windows key. On by default.
+    #[serde(default = "default_true")]
+    pub mac_shortcuts: bool,
     /// Support external speech-to-text tools that paste through macOS. When
     /// enabled, RDP123 synchronizes the clipboard before sending remote Ctrl+V.
     #[serde(default)]
@@ -422,6 +426,18 @@ pub struct Settings {
     /// replaced by the `ssh …` invocation (also `{host}`, `{port}`, `{user}`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_terminal: Option<String>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            terminal: TerminalKind::default(),
+            swap_cmd_alt: false,
+            mac_shortcuts: true,
+            external_stt_paste: false,
+            custom_terminal: None,
+        }
+    }
 }
 
 /// The top-level document persisted to disk.
@@ -675,6 +691,17 @@ mod tests {
             serde_json::from_str(r#"{"version":1,"connections":[],"settings":{}}"#).unwrap();
 
         assert!(!document.settings.external_stt_paste);
+    }
+
+    #[test]
+    fn missing_mac_shortcuts_setting_defaults_on() {
+        let field_missing: Document =
+            serde_json::from_str(r#"{"version":1,"connections":[],"settings":{}}"#).unwrap();
+        let settings_missing: Document =
+            serde_json::from_str(r#"{"version":1,"connections":[]}"#).unwrap();
+
+        assert!(field_missing.settings.mac_shortcuts);
+        assert!(settings_missing.settings.mac_shortcuts);
     }
 
     #[test]
