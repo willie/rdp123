@@ -46,7 +46,9 @@ define_class!(
         #[unsafe(method(validateMenuItem:))]
         fn validate_menu_item(&self, item: &NSMenuItem) -> bool {
             let action = item.action();
-            if action == Some(sel!(paste:)) {
+            if action == Some(sel!(hide:)) || action == Some(sel!(hideOtherApplications:)) {
+                true
+            } else if action == Some(sel!(paste:)) {
                 if self.ivars().external_stt_paste_enabled.get() {
                     self.external_stt_pasteboard_text().is_some()
                 } else {
@@ -164,6 +166,26 @@ define_class!(
         #[unsafe(method(performClose:))]
         fn perform_close(&self, _sender: Option<&AnyObject>) {
             self.forward_menu_shortcut(W_KEYCODE);
+        }
+
+        /// ⌘H and ⌥⌘H go to the remote the same way; choosing Hide from the
+        /// menu with the mouse still hides the app.
+        #[unsafe(method(hide:))]
+        fn hide(&self, sender: Option<&AnyObject>) {
+            if self.command_modifier_pressed() {
+                self.forward_menu_shortcut(H_KEYCODE);
+            } else {
+                NSApplication::sharedApplication(self.mtm()).hide(sender);
+            }
+        }
+
+        #[unsafe(method(hideOtherApplications:))]
+        fn hide_other_applications(&self, sender: Option<&AnyObject>) {
+            if self.command_modifier_pressed() {
+                self.forward_menu_shortcut(H_KEYCODE);
+            } else {
+                NSApplication::sharedApplication(self.mtm()).hideOtherApplications(sender);
+            }
         }
 
         #[unsafe(method(mouseDown:))]
@@ -739,6 +761,7 @@ const RIGHT_OPTION_KEYCODE: u16 = 0x3d;
 const A_KEYCODE: u16 = 0x00;
 const C_KEYCODE: u16 = 0x08;
 const F_KEYCODE: u16 = 0x03;
+const H_KEYCODE: u16 = 0x04;
 const V_KEYCODE: u16 = 0x09;
 const W_KEYCODE: u16 = 0x0d;
 const X_KEYCODE: u16 = 0x07;

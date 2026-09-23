@@ -17,24 +17,29 @@ use std::cell::{Cell, RefCell};
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
-use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
+use objc2::{
+    define_class, msg_send, sel, AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly,
+    Message,
+};
 use objc2_app_kit::{
     NSAccessibility, NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSBezelStyle,
     NSBorderType, NSBox, NSBoxType, NSButton, NSColor, NSControlStateValueOff,
-    NSControlStateValueOn, NSControlTextEditingDelegate, NSFont, NSGridCell, NSGridCellPlacement,
-    NSGridRow, NSGridRowAlignment, NSGridView, NSImage, NSImageName, NSImageNameAddTemplate,
-    NSImageNameRemoveTemplate, NSImageScaling, NSImageView, NSLayoutAttribute, NSLineBreakMode,
-    NSPasteboard, NSPasteboardTypeString, NSPopUpButton, NSScreen, NSScrollView, NSSecureTextField,
-    NSStackView, NSStackViewDistribution, NSStackViewGravity, NSTableCellView, NSTableColumn,
-    NSTableView, NSTableViewColumnAutoresizingStyle, NSTableViewDataSource, NSTableViewDelegate,
-    NSTableViewStyle, NSTextAlignment, NSTextField, NSTextFieldDelegate, NSToolbar,
-    NSToolbarDelegate, NSToolbarDisplayMode, NSToolbarItem, NSUserInterfaceLayoutOrientation,
-    NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask, NSWindowToolbarStyle, NSWorkspace,
+    NSControlStateValueOn, NSControlTextEditingDelegate, NSFont, NSFontAttributeName, NSGridCell,
+    NSGridCellPlacement, NSGridRow, NSGridRowAlignment, NSGridView, NSImage, NSImageName,
+    NSImageNameAddTemplate, NSImageNameRemoveTemplate, NSImageScaling, NSImageView,
+    NSLayoutAttribute, NSLineBreakMode, NSLinkAttributeName, NSPasteboard, NSPasteboardTypeString,
+    NSPopUpButton, NSScreen, NSScrollView, NSSecureTextField, NSStackView, NSStackViewDistribution,
+    NSStackViewGravity, NSTableCellView, NSTableColumn, NSTableView,
+    NSTableViewColumnAutoresizingStyle, NSTableViewDataSource, NSTableViewDelegate,
+    NSTableViewStyle, NSTextField, NSTextFieldDelegate, NSToolbar, NSToolbarDelegate,
+    NSToolbarDisplayMode, NSToolbarItem, NSUserInterfaceLayoutOrientation, NSView, NSWindow,
+    NSWindowDelegate, NSWindowStyleMask, NSWindowToolbarStyle,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{
-    NSArray, NSEdgeInsets, NSIndexSet, NSInteger, NSNotification, NSNumber, NSNumberFormatter,
-    NSObject, NSObjectProtocol, NSRange, NSString, NSURL,
+    NSArray, NSAttributedString, NSAttributedStringKey, NSDictionary, NSEdgeInsets, NSIndexSet,
+    NSInteger, NSNotification, NSNumber, NSNumberFormatter, NSObject, NSObjectProtocol, NSRange,
+    NSString, NSURL,
 };
 
 use rdp123_core::{
@@ -402,6 +407,7 @@ define_class!(
         #[unsafe(method(globalChanged:))]
         fn global_changed(&self, _s: Option<&AnyObject>) {
             self.save_global();
+            self.update_custom_enabled();
         }
 
         #[unsafe(method(loginItemChanged:))]
@@ -414,15 +420,6 @@ define_class!(
             }
         }
 
-        #[unsafe(method(openLibraryLink:))]
-        fn open_library_link(&self, sender: Option<&AnyObject>) {
-            let Some(sender) = sender else { return };
-            let title: Retained<NSString> = unsafe { msg_send![sender, title] };
-            let url = format!("https://crates.io/crates/{}", title);
-            if let Some(url) = NSURL::URLWithString(&NSString::from_str(&url)) {
-                NSWorkspace::sharedWorkspace().openURL(&url);
-            }
-        }
 
         #[unsafe(method(copyVersionInfo:))]
         fn copy_version_info(&self, _s: Option<&AnyObject>) {
@@ -661,7 +658,7 @@ impl SettingsController {
         let library_cells = |i: usize| -> [Retained<NSView>; 2] {
             match libs.get(i) {
                 Some((name, version)) => [
-                    view(&self.link_button(mtm, name)),
+                    view(&self.crate_link(mtm, name)),
                     view(&small(version, NSColor::secondaryLabelColor())),
                 ],
                 None => [
@@ -835,7 +832,7 @@ impl SettingsController {
 
         // Shown in the editor area when the list is empty / nothing is selected.
         let empty_state = NSTextField::labelWithString(
-            &NSString::from_str("No connection selected — click + to add one."),
+            &NSString::from_str(""), // text set by `update_visibility`
             mtm,
         );
         self.muted(&empty_state);
@@ -1324,7 +1321,7 @@ impl SettingsController {
             (
                 vec![
                     empty(),
-                    view(&label(
+                    view(&muted(
                         "Custom command is used only for the “Custom command…” terminal.",
                     )),
                 ],
@@ -1333,7 +1330,7 @@ impl SettingsController {
             (
                 vec![
                     empty(),
-                    view(&label(
+                    view(&muted(
                         "Placeholders: {ssh} = the full ssh command; {host}, {port}, {user} are also available.",
                     )),
                 ],
@@ -1342,7 +1339,7 @@ impl SettingsController {
             (
                 vec![
                     empty(),
-                    view(&label("This terminal is shared by every SSH connection.")),
+                    view(&muted("This terminal is shared by every SSH connection.")),
                 ],
                 0.0,
             ),
@@ -1350,7 +1347,7 @@ impl SettingsController {
             (
                 vec![
                     empty(),
-                    view(&label(
+                    view(&muted(
                         "Matches the PC key layout: the key next to the space bar is Alt.",
                     )),
                 ],
@@ -1417,21 +1414,29 @@ impl SettingsController {
         label.setTextColor(Some(&NSColor::secondaryLabelColor()));
     }
 
-    /// A borderless, link-coloured button whose title opens a crates.io page.
-    fn link_button(&self, mtm: MainThreadMarker, title: &str) -> Retained<NSButton> {
-        let b = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                &NSString::from_str(title),
-                Some(self.any()),
-                Some(sel!(openLibraryLink:)),
-                mtm,
+    /// A crate name linking to its crates.io page: text with a link
+    /// attribute, which AppKit draws, opens and exposes as a link.
+    fn crate_link(&self, mtm: MainThreadMarker, name: &str) -> Retained<NSTextField> {
+        let url = NSURL::URLWithString(&NSString::from_str(&format!(
+            "https://crates.io/crates/{name}"
+        )))
+        .expect("crate names form valid URLs");
+        let font = NSFont::systemFontOfSize(11.0);
+        let attributes = NSDictionary::<NSAttributedStringKey, AnyObject>::from_slices(
+            unsafe { &[NSLinkAttributeName, NSFontAttributeName] },
+            &[&*url as &AnyObject, &*font as &AnyObject],
+        );
+        let text = unsafe {
+            NSAttributedString::initWithString_attributes(
+                NSAttributedString::alloc(),
+                &NSString::from_str(name),
+                Some(&attributes),
             )
         };
-        b.setBordered(false);
-        b.setAlignment(NSTextAlignment::Left);
-        b.setFont(Some(&NSFont::systemFontOfSize(11.0)));
-        b.setContentTintColor(Some(&NSColor::linkColor()));
-        b
+        let link = NSTextField::labelWithAttributedString(&text, mtm);
+        link.setSelectable(true);
+        link.setAllowsEditingTextAttributes(true);
+        link
     }
 
     fn any(&self) -> &AnyObject {
@@ -1710,6 +1715,12 @@ impl SettingsController {
         }
         if let Some(e) = self.ivars().empty_label.borrow().as_ref() {
             e.setHidden(has_selection);
+            let message = if self.ivars().document.borrow().connections.is_empty() {
+                "No connections — click + to add one."
+            } else {
+                "Select a connection, or click + to add one."
+            };
+            e.setStringValue(&NSString::from_str(message));
         }
         if let Some(b) = self.ivars().remove_button.borrow().as_ref() {
             b.setEnabled(has_selection);
@@ -1823,6 +1834,7 @@ impl SettingsController {
         };
         self.set_popup(&iv.terminal, term_idx);
         self.set_field(&iv.custom, &custom);
+        self.update_custom_enabled();
         let swap_cmd_alt = iv.document.borrow().settings.swap_cmd_alt;
         self.set_check(&iv.swap_cmd_alt, swap_cmd_alt);
         let mac_shortcuts = iv.document.borrow().settings.mac_shortcuts;
@@ -2049,6 +2061,15 @@ impl SettingsController {
     }
 
     /// Global settings are simple and auto-save on change.
+    /// The custom command applies only to the "Custom command…" terminal.
+    fn update_custom_enabled(&self) {
+        let chosen = self.popup_index(&self.ivars().terminal).max(0) as usize;
+        let custom = TerminalKind::ALL.get(chosen) == Some(&TerminalKind::Custom);
+        if let Some(field) = self.ivars().custom.borrow().as_ref() {
+            field.setEnabled(custom);
+        }
+    }
+
     fn save_global(&self) {
         if self.ivars().loading.get() {
             return;
