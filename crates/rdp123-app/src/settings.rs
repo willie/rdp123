@@ -1,6 +1,6 @@
 //! The Settings window: manage connections and global settings.
 //!
-//! Layout: a "Connections | Global | About" segmented control switches panes. The
+//! Layout: a settings toolbar ("Connections", "Global", "About") switches panes. The
 //! Connection pane has the connection list plus a grouped editor; the Global
 //! pane has the shared SSH-terminal setting (entered once, used by every SSH
 //! connection).
@@ -21,16 +21,17 @@ use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThr
 use objc2_app_kit::{
     NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSBorderType, NSBox, NSBoxType,
     NSButton, NSColor, NSControlStateValueOff, NSControlStateValueOn, NSControlTextEditingDelegate,
-    NSFont, NSGridCell, NSGridCellPlacement, NSGridRow, NSGridRowAlignment, NSGridView,
+    NSFont, NSGridCell, NSGridCellPlacement, NSGridRow, NSGridRowAlignment, NSGridView, NSImage,
     NSImageView, NSPasteboard, NSPasteboardTypeString, NSPopUpButton, NSScrollView,
-    NSSecureTextField, NSSegmentSwitchTracking, NSSegmentedControl, NSStackView, NSTableColumn,
-    NSTableView, NSTableViewDataSource, NSTableViewDelegate, NSTextAlignment, NSTextField,
-    NSTextFieldDelegate, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
+    NSSecureTextField, NSStackView, NSTableColumn, NSTableView, NSTableViewDataSource,
+    NSTableViewDelegate, NSTextAlignment, NSTextField, NSTextFieldDelegate, NSToolbar,
+    NSToolbarDelegate, NSToolbarDisplayMode, NSToolbarItem, NSView, NSWindow, NSWindowDelegate,
+    NSWindowStyleMask, NSWindowToolbarStyle, NSWorkspace,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{
-    NSArray, NSIndexSet, NSInteger, NSNotification, NSObject, NSObjectProtocol, NSRange, NSString,
-    NSURL,
+    NSArray, NSEdgeInsets, NSIndexSet, NSInteger, NSNotification, NSObject, NSObjectProtocol,
+    NSRange, NSString, NSURL,
 };
 
 use rdp123_core::{
@@ -69,14 +70,27 @@ const AUTHENTICATION: [AuthenticationMode; 2] =
 
 // Window / layout geometry.
 const W: f64 = 720.0;
-const H: f64 = 760.0;
-const CH: f64 = 716.0; // container height (below the segmented control)
-const SEG_H: f64 = 24.0;
-const EDIT_TOP: f64 = 690.0; // top of the first editor row
+const CH: f64 = 800.0; // content height (below the toolbar)
+/// The About pane's frame math is written for this height; it is shifted up
+/// to the top of the taller content area.
+const ABOUT_H: f64 = 716.0;
+const GRID_TOP: f64 = 20.0; // space above the first grid row
+const INDENT: f64 = 20.0; // leading indent of a control that depends on the row above
 const FORM_X: f64 = 224.0;
 const LABEL_W: f64 = 150.0;
 const FIELD_W: f64 = 322.0;
 const ROW_H: f64 = 22.0;
+
+/// Toolbar panes: (item identifier, title, SF Symbol).
+const PANES: [(&str, &str, &str); 3] = [
+    ("connections", "Connections", "desktopcomputer"),
+    ("global", "Global", "gearshape"),
+    ("about", "About", "info.circle"),
+];
+
+fn pane_identifiers() -> Retained<NSArray<NSString>> {
+    NSArray::from_retained_slice(&PANES.map(|(id, ..)| NSString::from_str(id)))
+}
 
 fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
     CGRect::new(CGPoint::new(x, y), CGSize::new(w, h))
@@ -104,7 +118,10 @@ pub struct SettingsIvars {
     built: Cell<bool>,
     window: RefCell<Option<Retained<NSWindow>>>,
     table: RefCell<Option<Retained<NSTableView>>>,
-    segmented: RefCell<Option<Retained<NSSegmentedControl>>>,
+    /// Index into `PANES` of the visible pane; kept across openings so the
+    /// window returns to the pane people used last.
+    pane: Cell<usize>,
+    toolbar: RefCell<Option<Retained<NSToolbar>>>,
     conn_pane: RefCell<Option<Retained<NSScrollView>>>,
     global_pane: RefCell<Option<Retained<NSScrollView>>>,
     about_pane: RefCell<Option<Retained<NSScrollView>>>,
@@ -231,6 +248,33 @@ define_class!(
         }
     }
 
+    unsafe impl NSToolbarDelegate for SettingsController {
+        #[unsafe(method_id(toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:))]
+        fn toolbar_item(
+            &self,
+            _toolbar: &NSToolbar,
+            identifier: &NSString,
+            _will_insert: bool,
+        ) -> Option<Retained<NSToolbarItem>> {
+            self.pane_toolbar_item(identifier)
+        }
+
+        #[unsafe(method_id(toolbarDefaultItemIdentifiers:))]
+        fn toolbar_default_items(&self, _toolbar: &NSToolbar) -> Retained<NSArray<NSString>> {
+            pane_identifiers()
+        }
+
+        #[unsafe(method_id(toolbarAllowedItemIdentifiers:))]
+        fn toolbar_allowed_items(&self, _toolbar: &NSToolbar) -> Retained<NSArray<NSString>> {
+            pane_identifiers()
+        }
+
+        #[unsafe(method_id(toolbarSelectableItemIdentifiers:))]
+        fn toolbar_selectable_items(&self, _toolbar: &NSToolbar) -> Retained<NSArray<NSString>> {
+            pane_identifiers()
+        }
+    }
+
     impl SettingsController {
         #[unsafe(method(addConnection:))]
         fn add(&self, _s: Option<&AnyObject>) {
@@ -336,7 +380,14 @@ define_class!(
         }
 
         #[unsafe(method(paneChanged:))]
-        fn pane_changed(&self, _s: Option<&AnyObject>) {
+        fn pane_changed(&self, sender: Option<&AnyObject>) {
+            let Some(item) = sender.and_then(|s| s.downcast_ref::<NSToolbarItem>()) else {
+                return;
+            };
+            let id = item.itemIdentifier().to_string();
+            if let Some(index) = PANES.iter().position(|(pane_id, ..)| *pane_id == id) {
+                self.ivars().pane.set(index);
+            }
             self.update_visibility();
         }
 
@@ -419,9 +470,6 @@ impl SettingsController {
         }
         self.ivars().selected.set(-1);
         self.ivars().dirty.set(false);
-        if let Some(seg) = self.ivars().segmented.borrow().as_ref() {
-            seg.setSelectedSegment(0);
-        }
         self.reload_table();
         let first = if self.ivars().document.borrow().connections.is_empty() {
             -1
@@ -437,49 +485,34 @@ impl SettingsController {
     }
 
     fn build(&self, mtm: MainThreadMarker) {
-        // Fixed size: the panes are laid out with frame math for exactly this
-        // content size, so resizing would only reveal dead space.
-        let style = NSWindowStyleMask::Titled
-            | NSWindowStyleMask::Closable
-            | NSWindowStyleMask::Miniaturizable;
+        // Fixed size: the connection list and the About pane are laid out
+        // with frame math for this content size. No minimize button: ⌘,
+        // reopens settings, so there is no reason to keep it in the Dock.
+        let style = NSWindowStyleMask::Titled | NSWindowStyleMask::Closable;
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
                 NSWindow::alloc(mtm),
-                rect(0.0, 0.0, W, H),
+                rect(0.0, 0.0, W, CH),
                 style,
                 NSBackingStoreType::Buffered,
                 false,
             )
         };
-        window.setTitle(&NSString::from_str("RDP123 Settings"));
         unsafe { window.setReleasedWhenClosed(false) };
         window.setDelegate(Some(ProtocolObject::from_ref(self)));
         let content = window.contentView().expect("content view");
 
-        // ---- pane switch ----
-        let labels = NSArray::from_retained_slice(&[
-            NSString::from_str("Connections"),
-            NSString::from_str("Global"),
-            NSString::from_str("About"),
-        ]);
-        let seg = unsafe {
-            NSSegmentedControl::segmentedControlWithLabels_trackingMode_target_action(
-                &labels,
-                NSSegmentSwitchTracking::SelectOne,
-                Some(self.any()),
-                Some(sel!(paneChanged:)),
-                mtm,
-            )
-        };
-        seg.setFrame(rect((W - 360.0) / 2.0, H - 36.0, 360.0, SEG_H));
-        seg.setAutoresizingMask(
-            NSAutoresizingMaskOptions::ViewMinXMargin
-                | NSAutoresizingMaskOptions::ViewMaxXMargin
-                | NSAutoresizingMaskOptions::ViewMinYMargin,
+        // ---- pane switch: a settings toolbar ----
+        let toolbar = NSToolbar::initWithIdentifier(
+            NSToolbar::alloc(mtm),
+            &NSString::from_str("RDP123Settings"),
         );
-        seg.setSelectedSegment(0);
-        content.addSubview(&seg);
-        *self.ivars().segmented.borrow_mut() = Some(seg);
+        toolbar.setDelegate(Some(ProtocolObject::from_ref(self)));
+        toolbar.setAllowsUserCustomization(false);
+        toolbar.setDisplayMode(NSToolbarDisplayMode::IconAndLabel);
+        window.setToolbarStyle(NSWindowToolbarStyle::Preference);
+        window.setToolbar(Some(&toolbar));
+        *self.ivars().toolbar.borrow_mut() = Some(toolbar);
 
         // ---- panes ----
         let conn_scroll =
@@ -551,21 +584,25 @@ impl SettingsController {
 
     /// Standard macOS "About" layout: icon, name, version, then the libraries.
     fn build_about_pane(&self, mtm: MainThreadMarker, parent: &NSView) {
+        // Everything but the bottom license line keeps its distance from the
+        // top of the pane.
+        let up = CH - ABOUT_H;
+
         // App icon, centered.
         if let Some(icon) = NSApplication::sharedApplication(mtm).applicationIconImage() {
             let view = NSImageView::imageViewWithImage(&icon, mtm);
-            view.setFrame(rect((W - 96.0) / 2.0, 584.0, 96.0, 96.0));
+            view.setFrame(rect((W - 96.0) / 2.0, up + 584.0, 96.0, 96.0));
             parent.addSubview(&view);
         }
 
         // Name + version identity block.
-        let title = self.centered(mtm, parent, 544.0, 32.0, "RDP123");
+        let title = self.centered(mtm, parent, up + 544.0, 32.0, "RDP123");
         title.setFont(Some(&NSFont::boldSystemFontOfSize(26.0)));
 
         let version = self.centered(
             mtm,
             parent,
-            518.0,
+            up + 518.0,
             18.0,
             &format!(
                 "Version {} ({})",
@@ -579,7 +616,7 @@ impl SettingsController {
         let built = self.centered(
             mtm,
             parent,
-            498.0,
+            up + 498.0,
             16.0,
             &format!("Built {}", env!("RDP123_BUILD_TIME")),
         );
@@ -590,24 +627,25 @@ impl SettingsController {
         let copy = self.button_ret(
             mtm,
             parent,
-            rect((W - 150.0) / 2.0, 460.0, 150.0, 28.0),
+            rect((W - 150.0) / 2.0, up + 460.0, 150.0, 28.0),
             "Copy Version Info",
             sel!(copyVersionInfo:),
         );
         let _ = copy;
 
         // Separator line.
-        let separator = NSBox::initWithFrame(NSBox::alloc(mtm), rect(120.0, 444.0, W - 240.0, 1.0));
+        let separator =
+            NSBox::initWithFrame(NSBox::alloc(mtm), rect(120.0, up + 444.0, W - 240.0, 1.0));
         separator.setBoxType(NSBoxType::Separator);
         parent.addSubview(&separator);
 
         // Direct runtime libraries, in two compact columns of crates.io links.
-        let header = self.centered(mtm, parent, 408.0, 18.0, "Open Source Libraries");
+        let header = self.centered(mtm, parent, up + 408.0, 18.0, "Open Source Libraries");
         header.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
         let note = self.centered(
             mtm,
             parent,
-            388.0,
+            up + 388.0,
             15.0,
             "Direct runtime dependencies — click a name to view it on crates.io.",
         );
@@ -622,7 +660,7 @@ impl SettingsController {
         let rows = libs.len().div_ceil(2);
         for (i, (name, version)) in libs.iter().enumerate() {
             let col_x = if i < rows { 68.0 } else { 374.0 };
-            let y = 356.0 - (i % rows) as f64 * 19.0;
+            let y = up + 356.0 - (i % rows) as f64 * 19.0;
             self.link_button(mtm, parent, rect(col_x, y, 176.0, 18.0), name);
             let ver = self.label(mtm, parent, rect(col_x + 182.0, y, 82.0, 18.0), version);
             ver.setFont(Some(&NSFont::systemFontOfSize(11.0)));
@@ -777,7 +815,19 @@ impl SettingsController {
         let heading = |t: &str, g| {
             let l = label(t);
             l.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
-            (view(&l), empty(), g, true, 6.0)
+            (view(&l), empty(), g, true, 12.0)
+        };
+        // A control that only applies when the one above it is set, indented
+        // under it (HIG: indentation conveys hierarchy).
+        let dependent = |views: &[Retained<NSView>]| {
+            let stack = NSStackView::stackViewWithViews(&NSArray::from_retained_slice(views), mtm);
+            stack.setEdgeInsets(NSEdgeInsets {
+                top: 0.0,
+                left: INDENT,
+                bottom: 0.0,
+                right: 0.0,
+            });
+            stack
         };
 
         let name = text("Office PC", FIELD_W);
@@ -803,11 +853,7 @@ impl SettingsController {
         let res_mode = popup(&["Fit to window", "Fixed"], sel!(resModeChanged:), 160.0);
         let res_w = text("1920", 70.0);
         let res_h = text("1080", 70.0);
-        let fixed_size = NSStackView::stackViewWithViews(
-            &NSArray::from_retained_slice(&[view(&res_w), view(&label("×")), view(&res_h)]),
-            mtm,
-        );
-        fixed_size.setSpacing(6.0);
+        let fixed_size = dependent(&[view(&res_w), view(&label("×")), view(&res_h)]);
         let scaling = popup(&["Auto", "100%", "140%", "180%", "200%"], dirty, 120.0);
         let color = popup(&["High (32-bit)", "Medium (16-bit)"], dirty, 180.0);
         let graphics = popup(
@@ -837,6 +883,7 @@ impl SettingsController {
         );
         let reconnect = checkbox("Automatically reconnect after connection drops");
         let rate = text("", 60.0);
+        let rate_row = dependent(&[view(&label("Max attempts/minute:")), view(&rate)]);
         let keep_alive = checkbox("Keep session awake");
         keep_alive.setToolTip(Some(&NSString::from_str(
             "While idle, taps an invisible key so the remote session is not \
@@ -880,7 +927,7 @@ impl SettingsController {
             ),
             heading("Display", Rdp),
             field("Resolution:", &res_mode, Rdp),
-            field("Fixed size:", &fixed_size, Rdp),
+            control(&fixed_size, Rdp),
             field("Scaling:", &scaling, Rdp),
             field("Color quality:", &color, Rdp),
             field("Graphics:", &graphics, Rdp),
@@ -891,7 +938,7 @@ impl SettingsController {
             field("Clipboard:", &clipboard, Rdp),
             field("Play sound:", &audio, Rdp),
             control(&reconnect, Rdp),
-            field("Max attempts/minute:", &rate, Rdp),
+            control(&rate_row, Rdp),
             control(&keep_alive, Rdp),
             field("Wake on LAN (MAC):", &wake_mac, Rdp),
         ];
@@ -902,8 +949,6 @@ impl SettingsController {
             .map(|(l, c, ..)| NSArray::from_retained_slice(&[l.clone(), c.clone()]))
             .collect();
         let grid = NSGridView::gridViewWithViews(&NSArray::from_retained_slice(&grid_rows), mtm);
-        grid.setRowSpacing(2.0);
-        grid.setColumnSpacing(8.0);
         grid.setRowAlignment(NSGridRowAlignment::FirstBaseline);
         let labels = grid.columnAtIndex(0);
         labels.setXPlacement(NSGridCellPlacement::Trailing);
@@ -943,7 +988,7 @@ impl SettingsController {
         grid.setTranslatesAutoresizingMaskIntoConstraints(false);
         parent.addSubview(&grid);
         grid.topAnchor()
-            .constraintEqualToAnchor_constant(&parent.topAnchor(), CH - EDIT_TOP - 20.0)
+            .constraintEqualToAnchor_constant(&parent.topAnchor(), GRID_TOP)
             .setActive(true);
         grid.leadingAnchor()
             .constraintEqualToAnchor_constant(&parent.leadingAnchor(), FORM_X)
@@ -1039,13 +1084,9 @@ impl SettingsController {
             sel!(loginItemChanged:),
         );
 
-        let title = label("Global settings");
-        title.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
-
         // (row, extra space above it)
         let mut rows: Vec<(Vec<Retained<NSView>>, f64)> = vec![
-            (vec![view(&title), empty()], 0.0),
-            (vec![view(&label("SSH terminal:")), view(&term)], 8.0),
+            (vec![view(&label("SSH terminal:")), view(&term)], 0.0),
             (vec![view(&label("Custom command:")), view(&custom)], 0.0),
             (
                 vec![
@@ -1108,8 +1149,6 @@ impl SettingsController {
             .map(|(cells, _)| NSArray::from_retained_slice(cells))
             .collect();
         let grid = NSGridView::gridViewWithViews(&NSArray::from_retained_slice(&grid_rows), mtm);
-        grid.setRowSpacing(6.0);
-        grid.setColumnSpacing(8.0);
         grid.setRowAlignment(NSGridRowAlignment::FirstBaseline);
         grid.columnAtIndex(0)
             .setXPlacement(NSGridCellPlacement::Trailing);
@@ -1118,15 +1157,11 @@ impl SettingsController {
         for (i, (_, padding)) in rows.iter().enumerate() {
             grid.rowAtIndex(i as isize).setTopPadding(*padding);
         }
-        // The title spans both columns and sits at the leading edge.
-        grid.mergeCellsInHorizontalRange_verticalRange(NSRange::new(0, 2), NSRange::new(0, 1));
-        grid.cellAtColumnIndex_rowIndex(0, 0)
-            .setXPlacement(NSGridCellPlacement::Leading);
 
         grid.setTranslatesAutoresizingMaskIntoConstraints(false);
         parent.addSubview(&grid);
         grid.topAnchor()
-            .constraintEqualToAnchor_constant(&parent.topAnchor(), 20.0)
+            .constraintEqualToAnchor_constant(&parent.topAnchor(), GRID_TOP)
             .setActive(true);
         grid.leadingAnchor()
             .constraintEqualToAnchor_constant(&parent.leadingAnchor(), 32.0)
@@ -1205,13 +1240,29 @@ impl SettingsController {
 
     // ---------- data flow ----------
 
-    fn pane(&self) -> isize {
-        self.ivars()
-            .segmented
-            .borrow()
-            .as_ref()
-            .map(|s| s.selectedSegment())
-            .unwrap_or(0)
+    fn pane_toolbar_item(&self, identifier: &NSString) -> Option<Retained<NSToolbarItem>> {
+        let id = identifier.to_string();
+        let (_, title, symbol) = PANES.iter().find(|(pane_id, ..)| *pane_id == id)?;
+        let item =
+            NSToolbarItem::initWithItemIdentifier(NSToolbarItem::alloc(self.mtm()), identifier);
+        let title = NSString::from_str(title);
+        item.setLabel(&title);
+        item.setImage(
+            NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                &NSString::from_str(symbol),
+                Some(&title),
+            )
+            .as_deref(),
+        );
+        unsafe {
+            item.setTarget(Some(self.any()));
+            item.setAction(Some(sel!(paneChanged:)));
+        }
+        Some(item)
+    }
+
+    fn pane(&self) -> usize {
+        self.ivars().pane.get()
     }
 
     fn save_document(&self, document: &Document) -> bool {
@@ -1359,6 +1410,13 @@ impl SettingsController {
         }
         if let Some(a) = self.ivars().about_pane.borrow().as_ref() {
             a.setHidden(pane != 2);
+        }
+        let (id, title, _) = PANES[pane];
+        if let Some(w) = self.ivars().window.borrow().as_ref() {
+            w.setTitle(&NSString::from_str(title));
+        }
+        if let Some(t) = self.ivars().toolbar.borrow().as_ref() {
+            t.setSelectedItemIdentifier(Some(&NSString::from_str(id)));
         }
         let has_selection = self.ivars().selected.get() >= 0;
         let is_ssh = self
