@@ -23,12 +23,13 @@ use objc2_app_kit::{
     NSBox, NSBoxType, NSButton, NSCell, NSColor, NSControlStateValueOff, NSControlStateValueOn,
     NSControlTextEditingDelegate, NSFont, NSGridCell, NSGridCellPlacement, NSGridRow,
     NSGridRowAlignment, NSGridView, NSImage, NSImageName, NSImageNameAddTemplate,
-    NSImageNameRemoveTemplate, NSImageView, NSLineBreakMode, NSPasteboard, NSPasteboardTypeString,
-    NSPopUpButton, NSScreen, NSScrollView, NSSecureTextField, NSStackView, NSStackViewDistribution,
-    NSTableColumn, NSTableView, NSTableViewColumnAutoresizingStyle, NSTableViewDataSource,
-    NSTableViewDelegate, NSTableViewStyle, NSTextAlignment, NSTextField, NSTextFieldDelegate,
-    NSToolbar, NSToolbarDelegate, NSToolbarDisplayMode, NSToolbarItem, NSView, NSWindow,
-    NSWindowDelegate, NSWindowStyleMask, NSWindowToolbarStyle, NSWorkspace,
+    NSImageNameRemoveTemplate, NSImageScaling, NSImageView, NSLayoutAttribute, NSLineBreakMode,
+    NSPasteboard, NSPasteboardTypeString, NSPopUpButton, NSScreen, NSScrollView, NSSecureTextField,
+    NSStackView, NSStackViewDistribution, NSTableColumn, NSTableView,
+    NSTableViewColumnAutoresizingStyle, NSTableViewDataSource, NSTableViewDelegate,
+    NSTableViewStyle, NSTextAlignment, NSTextField, NSTextFieldDelegate, NSToolbar,
+    NSToolbarDelegate, NSToolbarDisplayMode, NSToolbarItem, NSUserInterfaceLayoutOrientation,
+    NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask, NSWindowToolbarStyle, NSWorkspace,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{
@@ -573,13 +574,11 @@ impl SettingsController {
         let conn_height = self.build_connection_pane(mtm, &conn);
         let global_height = self.build_global_pane(mtm, &global);
 
-        // About keeps its frame layout, inside a flipped document so it
-        // shows from the top and scrolls when the screen is too short.
-        let about_content = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, W, CH));
-        let about_height = self.build_about_pane(mtm, &about_content);
-        about_content.setFrameSize(CGSize::new(W, about_height));
-        let about_document = FlippedView::new(mtm, rect(0.0, 0.0, W, about_height));
-        about_document.addSubview(&about_content);
+        // About sits in a flipped document so it shows from the top and
+        // scrolls when the screen is too short.
+        let about_document = FlippedView::new(mtm, rect(0.0, 0.0, W, CH));
+        let about_height = self.build_about_pane(mtm, &about_document);
+        about_document.setFrameSize(CGSize::new(W, about_height));
         let about_scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), about.bounds());
         about_scroll.setAutoresizingMask(
             NSAutoresizingMaskOptions::ViewWidthSizable
@@ -602,115 +601,138 @@ impl SettingsController {
         *self.ivars().window.borrow_mut() = Some(window);
     }
 
-    /// A centered label helper for the About pane.
-    fn centered(
-        &self,
-        mtm: MainThreadMarker,
-        parent: &NSView,
-        y: f64,
-        h: f64,
-        text: &str,
-    ) -> Retained<NSTextField> {
-        let l = self.label(mtm, parent, rect(60.0, y, W - 120.0, h), text);
-        l.setAlignment(NSTextAlignment::Center);
-        l
-    }
-
-    /// Standard macOS "About" layout: icon, name, version, then the libraries.
-    /// Returns the pane's preferred content height, which grows with the
-    /// library list.
+    /// Standard macOS "About" layout, as one centered column: icon, name,
+    /// version, then the libraries. Returns the pane's preferred height.
     fn build_about_pane(&self, mtm: MainThreadMarker, parent: &NSView) -> f64 {
+        let view = |v: &NSView| -> Retained<NSView> { v.retain() };
+        let label = |text: &str| NSTextField::labelWithString(&NSString::from_str(text), mtm);
+        let small = |text: &str, color: Retained<NSColor>| {
+            let l = label(text);
+            l.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+            l.setTextColor(Some(&color));
+            l
+        };
+
+        let mut column: Vec<Retained<NSView>> = Vec::new();
+        if let Some(icon) = NSApplication::sharedApplication(mtm).applicationIconImage() {
+            let image = NSImageView::imageViewWithImage(&icon, mtm);
+            image.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
+            image
+                .widthAnchor()
+                .constraintEqualToConstant(96.0)
+                .setActive(true);
+            image
+                .heightAnchor()
+                .constraintEqualToConstant(96.0)
+                .setActive(true);
+            column.push(view(&image));
+        }
+        let title = label("RDP123");
+        title.setFont(Some(&NSFont::boldSystemFontOfSize(26.0)));
+        let version = label(&format!(
+            "Version {} ({})",
+            env!("CARGO_PKG_VERSION"),
+            env!("RDP123_GIT")
+        ));
+        self.muted(&version);
+        version.setSelectable(true);
+        let built = small(
+            &format!("Built {}", env!("RDP123_BUILD_TIME")),
+            NSColor::tertiaryLabelColor(),
+        );
+        built.setSelectable(true);
+        let copy = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("Copy Version Info"),
+                Some(self.any()),
+                Some(sel!(copyVersionInfo:)),
+                mtm,
+            )
+        };
+        let separator = NSBox::initWithFrame(NSBox::alloc(mtm), CGRect::ZERO);
+        separator.setBoxType(NSBoxType::Separator);
+        let header = label("Open Source Libraries");
+        header.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
+        let note = small(
+            "Direct runtime dependencies — click a name to view it on crates.io.",
+            NSColor::secondaryLabelColor(),
+        );
+
+        // Direct runtime libraries in two compact columns of crates.io links:
+        // name, version, name, version.
         let libs: Vec<(&str, &str)> = env!("RDP123_LIBS")
             .split(';')
             .filter(|s| !s.is_empty())
             .map(|entry| entry.split_once(' ').unwrap_or((entry, "")))
             .collect();
         let rows = libs.len().div_ceil(2);
-        // Keep the last library row clear of the license line: when the list
-        // is longer than the base layout allows, grow the pane and move
-        // everything above the license line up by the difference.
-        let lowest_row = 356.0 - rows.saturating_sub(1) as f64 * 19.0;
-        let up = (60.0 - lowest_row).max(0.0);
+        let library_cells = |i: usize| -> [Retained<NSView>; 2] {
+            match libs.get(i) {
+                Some((name, version)) => [
+                    view(&self.link_button(mtm, name)),
+                    view(&small(version, NSColor::secondaryLabelColor())),
+                ],
+                None => [
+                    NSGridCell::emptyContentView(mtm),
+                    NSGridCell::emptyContentView(mtm),
+                ],
+            }
+        };
+        let library_rows: Vec<Retained<NSArray<NSView>>> = (0..rows)
+            .map(|row| {
+                let [left_name, left_version] = library_cells(row);
+                let [right_name, right_version] = library_cells(row + rows);
+                NSArray::from_retained_slice(&[left_name, left_version, right_name, right_version])
+            })
+            .collect();
+        let libraries =
+            NSGridView::gridViewWithViews(&NSArray::from_retained_slice(&library_rows), mtm);
+        libraries.setRowSpacing(3.0); // a compact credits list
+        libraries.setRowAlignment(NSGridRowAlignment::FirstBaseline);
+        libraries.columnAtIndex(2).setLeadingPadding(24.0);
 
-        // App icon, centered.
-        if let Some(icon) = NSApplication::sharedApplication(mtm).applicationIconImage() {
-            let view = NSImageView::imageViewWithImage(&icon, mtm);
-            view.setFrame(rect((W - 96.0) / 2.0, up + 584.0, 96.0, 96.0));
-            parent.addSubview(&view);
+        let license = small(
+            "Open source under GNU GPL v3.0",
+            NSColor::tertiaryLabelColor(),
+        );
+
+        column.extend([
+            view(&title),
+            view(&version),
+            view(&built),
+            view(&copy),
+            view(&separator),
+            view(&header),
+            view(&note),
+            view(&libraries),
+            view(&license),
+        ]);
+        let stack = NSStackView::stackViewWithViews(&NSArray::from_retained_slice(&column), mtm);
+        stack.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
+        stack.setAlignment(NSLayoutAttribute::CenterX);
+        // Space between the groups: identity, the copy button, the libraries,
+        // and the license.
+        let group_ends: [&NSView; 4] = [&built, &copy, &separator, &libraries];
+        for group_end in group_ends {
+            stack.setCustomSpacing_afterView(20.0, group_end);
         }
+        separator
+            .widthAnchor()
+            .constraintEqualToAnchor(&libraries.widthAnchor())
+            .setActive(true);
 
-        // Name + version identity block.
-        let title = self.centered(mtm, parent, up + 544.0, 32.0, "RDP123");
-        title.setFont(Some(&NSFont::boldSystemFontOfSize(26.0)));
+        stack.setTranslatesAutoresizingMaskIntoConstraints(false);
+        parent.addSubview(&stack);
+        stack
+            .topAnchor()
+            .constraintEqualToAnchor_constant(&parent.topAnchor(), MARGIN)
+            .setActive(true);
+        stack
+            .centerXAnchor()
+            .constraintEqualToAnchor(&parent.centerXAnchor())
+            .setActive(true);
 
-        let version = self.centered(
-            mtm,
-            parent,
-            up + 518.0,
-            18.0,
-            &format!(
-                "Version {} ({})",
-                env!("CARGO_PKG_VERSION"),
-                env!("RDP123_GIT")
-            ),
-        );
-        self.muted(&version);
-        version.setSelectable(true);
-
-        let built = self.centered(
-            mtm,
-            parent,
-            up + 498.0,
-            16.0,
-            &format!("Built {}", env!("RDP123_BUILD_TIME")),
-        );
-        built.setFont(Some(&NSFont::systemFontOfSize(11.0)));
-        built.setTextColor(Some(&NSColor::tertiaryLabelColor()));
-        built.setSelectable(true);
-
-        let copy = self.button_ret(
-            mtm,
-            parent,
-            rect((W - 150.0) / 2.0, up + 460.0, 150.0, 28.0),
-            "Copy Version Info",
-            sel!(copyVersionInfo:),
-        );
-        let _ = copy;
-
-        // Separator line.
-        let separator =
-            NSBox::initWithFrame(NSBox::alloc(mtm), rect(120.0, up + 444.0, W - 240.0, 1.0));
-        separator.setBoxType(NSBoxType::Separator);
-        parent.addSubview(&separator);
-
-        // Direct runtime libraries, in two compact columns of crates.io links.
-        let header = self.centered(mtm, parent, up + 408.0, 18.0, "Open Source Libraries");
-        header.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
-        let note = self.centered(
-            mtm,
-            parent,
-            up + 388.0,
-            15.0,
-            "Direct runtime dependencies — click a name to view it on crates.io.",
-        );
-        note.setFont(Some(&NSFont::systemFontOfSize(11.0)));
-        self.muted(&note);
-
-        for (i, (name, version)) in libs.iter().enumerate() {
-            let col_x = if i < rows { 68.0 } else { 374.0 };
-            let y = up + 356.0 - (i % rows) as f64 * 19.0;
-            self.link_button(mtm, parent, rect(col_x, y, 176.0, 18.0), name);
-            let ver = self.label(mtm, parent, rect(col_x + 182.0, y, 82.0, 18.0), version);
-            ver.setFont(Some(&NSFont::systemFontOfSize(11.0)));
-            self.muted(&ver);
-        }
-
-        // License line pinned to the bottom.
-        let license = self.centered(mtm, parent, 28.0, 15.0, "Open source under GNU GPL v3.0");
-        license.setFont(Some(&NSFont::systemFontOfSize(11.0)));
-        license.setTextColor(Some(&NSColor::tertiaryLabelColor()));
-
-        CH + up
+        MARGIN + stack.fittingSize().height + MARGIN
     }
 
     /// Returns the pane's preferred content height: the editor's tallest
@@ -1329,7 +1351,7 @@ impl SettingsController {
     }
 
     /// A borderless, link-coloured button whose title opens a crates.io page.
-    fn link_button(&self, mtm: MainThreadMarker, parent: &NSView, f: CGRect, title: &str) {
+    fn link_button(&self, mtm: MainThreadMarker, title: &str) -> Retained<NSButton> {
         let b = unsafe {
             NSButton::buttonWithTitle_target_action(
                 &NSString::from_str(title),
@@ -1338,12 +1360,11 @@ impl SettingsController {
                 mtm,
             )
         };
-        b.setFrame(f);
         b.setBordered(false);
         b.setAlignment(NSTextAlignment::Left);
         b.setFont(Some(&NSFont::systemFontOfSize(11.0)));
         b.setContentTintColor(Some(&NSColor::linkColor()));
-        parent.addSubview(&b);
+        b
     }
 
     fn button_ret(
