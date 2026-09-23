@@ -162,6 +162,11 @@ define_class!(
             status.setMenu(Some(&menu));
             self.rebuild_menu(&menu, mtm);
             self.ivars().borrow_mut().status_item = Some(status);
+
+            // `open RDP123.app --args --settings` opens Settings at launch.
+            if std::env::args().any(|arg| arg == "--settings") {
+                self.show_settings();
+            }
         }
 
         /// Add every live RDP session to the Dock icon's context menu. macOS
