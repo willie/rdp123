@@ -21,14 +21,16 @@ use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThr
 use objc2_app_kit::{
     NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSBorderType, NSBox, NSBoxType,
     NSButton, NSColor, NSControlStateValueOff, NSControlStateValueOn, NSControlTextEditingDelegate,
-    NSFont, NSImageView, NSPasteboard, NSPasteboardTypeString, NSPopUpButton, NSScrollView,
-    NSSecureTextField, NSSegmentSwitchTracking, NSSegmentedControl, NSTableColumn, NSTableView,
-    NSTableViewDataSource, NSTableViewDelegate, NSTextAlignment, NSTextField, NSTextFieldDelegate,
-    NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
+    NSFont, NSGridCell, NSGridCellPlacement, NSGridRowAlignment, NSGridView, NSImageView,
+    NSPasteboard, NSPasteboardTypeString, NSPopUpButton, NSScrollView, NSSecureTextField,
+    NSSegmentSwitchTracking, NSSegmentedControl, NSTableColumn, NSTableView, NSTableViewDataSource,
+    NSTableViewDelegate, NSTextAlignment, NSTextField, NSTextFieldDelegate, NSView, NSWindow,
+    NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{
-    NSArray, NSIndexSet, NSInteger, NSNotification, NSObject, NSObjectProtocol, NSString, NSURL,
+    NSArray, NSIndexSet, NSInteger, NSNotification, NSObject, NSObjectProtocol, NSRange, NSString,
+    NSURL,
 };
 
 use rdp123_core::{
@@ -982,125 +984,162 @@ impl SettingsController {
         *self.ivars().ssh_group.borrow_mut() = ssh;
     }
 
+    /// Laid out by an `NSGridView`: a right-aligned label column and a control
+    /// column, rows aligned on their first baseline. No frame arithmetic.
     fn build_global_pane(&self, mtm: MainThreadMarker, parent: &NSView) {
-        let gx = 32.0;
-        let gfield = 176.0;
-        let mut y = EDIT_TOP;
-        self.header(mtm, parent, &mut y, "Global settings");
+        let label = |text: &str| NSTextField::labelWithString(&NSString::from_str(text), mtm);
+        let muted = |text: &str| {
+            let l = label(text);
+            self.muted(&l);
+            l
+        };
+        let checkbox = |title: &str, action: Sel| unsafe {
+            NSButton::checkboxWithTitle_target_action(
+                &NSString::from_str(title),
+                Some(self.any()),
+                Some(action),
+                mtm,
+            )
+        };
+        let view = |v: &NSView| -> Retained<NSView> { v.retain() };
+        let empty = || NSGridCell::emptyContentView(mtm);
 
-        self.label(mtm, parent, rect(gx, y, 140.0, ROW_H), "SSH terminal:");
-        let terms: Vec<&str> = TerminalKind::ALL.iter().map(|k| k.display_name()).collect();
-        let term = self.popup(
-            mtm,
-            parent,
-            rect(gfield, y, 240.0, ROW_H + 2.0),
-            &terms,
-            sel!(globalChanged:),
+        let term = NSPopUpButton::initWithFrame_pullsDown(
+            NSPopUpButton::alloc(mtm),
+            rect(0.0, 0.0, 240.0, ROW_H + 2.0),
+            false,
         );
-        *self.ivars().terminal.borrow_mut() = Some(term);
-        y -= PITCH;
+        for kind in TerminalKind::ALL {
+            term.addItemWithTitle(&NSString::from_str(kind.display_name()));
+        }
+        unsafe {
+            term.setTarget(Some(self.any()));
+            term.setAction(Some(sel!(globalChanged:)));
+        }
 
-        self.label(mtm, parent, rect(gx, y, 140.0, ROW_H), "Custom command:");
-        let custom = self.plain_text(mtm, parent, rect(gfield, y, 500.0, ROW_H));
+        let custom = NSTextField::initWithFrame(NSTextField::alloc(mtm), CGRect::ZERO);
+        unsafe { custom.setDelegate(Some(ProtocolObject::from_ref(self))) };
         custom.setPlaceholderString(Some(&NSString::from_str("e.g. wezterm start -- {ssh}")));
-        *self.ivars().custom.borrow_mut() = Some(custom);
-        y -= PITCH + 6.0;
+        custom
+            .widthAnchor()
+            .constraintEqualToConstant(440.0)
+            .setActive(true);
 
-        self.label(
-            mtm,
-            parent,
-            rect(gx, y, 640.0, ROW_H),
-            "Custom command is used only for the “Custom command…” terminal.",
-        );
-        y -= ROW_H + 2.0;
-        self.label(
-            mtm, parent, rect(gx, y, 640.0, ROW_H),
-            "Placeholders: {ssh} = the full ssh command; {host}, {port}, {user} are also available.",
-        );
-        y -= ROW_H + 2.0;
-        self.label(
-            mtm,
-            parent,
-            rect(gx, y, 640.0, ROW_H),
-            "This terminal is shared by every SSH connection.",
-        );
-        y -= PITCH + 10.0;
-
-        let keyboard_header = self.label(mtm, parent, rect(gx, y, 460.0, 20.0), "Keyboard");
-        keyboard_header.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
-        y -= HDR_PITCH;
-        let swap = self.checkbox_fit(
-            mtm,
-            parent,
-            gfield,
-            y,
+        let swap = checkbox(
             "Swap ⌘ and ⌥ in RDP sessions (⌘ acts as Alt, ⌥ as the Windows key)",
             sel!(globalChanged:),
         );
-        *self.ivars().swap_cmd_alt.borrow_mut() = Some(swap);
-        y -= PITCH;
-        self.label(
-            mtm,
-            parent,
-            rect(gx, y, 640.0, ROW_H),
-            "Matches the PC key layout: the key next to the space bar is Alt.",
-        );
-        y -= PITCH;
-        let mac_shortcuts = self.checkbox_fit(
-            mtm,
-            parent,
-            gfield,
-            y,
+        let mac_shortcuts = checkbox(
             "Use Mac shortcuts in RDP sessions (⌘C, ⌘V, ⌘X, ⌘A, ⌘Z, ⌘F, ⌘W send Ctrl)",
             sel!(globalChanged:),
         );
-        *self.ivars().mac_shortcuts.borrow_mut() = Some(mac_shortcuts);
-        y -= PITCH + 10.0;
-
-        let stt_header = self.label(mtm, parent, rect(gx, y, 460.0, 20.0), "Speech to text");
-        stt_header.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
-        y -= HDR_PITCH;
-        let external_stt_paste = self.checkbox_fit(
-            mtm,
-            parent,
-            gfield,
-            y,
+        let external_stt_paste = checkbox(
             "Enable external STT paste in RDP sessions",
             sel!(globalChanged:),
         );
-        *self.ivars().external_stt_paste.borrow_mut() = Some(external_stt_paste);
-        y -= CHECKBOX_PITCH;
-        let stt_note = self.label(
-            mtm,
-            parent,
-            rect(gx, y, 640.0, ROW_H),
-            "Synchronizes macOS clipboard text before inserting it remotely with Ctrl+V.",
-        );
-        self.muted(&stt_note);
-        y -= PITCH + 10.0;
-
-        let startup_header = self.label(mtm, parent, rect(gx, y, 460.0, 20.0), "Startup");
-        startup_header.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
-        y -= HDR_PITCH;
-        let login = self.checkbox_fit(
-            mtm,
-            parent,
-            gfield,
-            y,
+        let login = checkbox(
             "Start RDP123 automatically when you log in",
             sel!(loginItemChanged:),
         );
+
+        let title = label("Global settings");
+        title.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
+
+        // (row, extra space above it)
+        let mut rows: Vec<(Vec<Retained<NSView>>, f64)> = vec![
+            (vec![view(&title), empty()], 0.0),
+            (vec![view(&label("SSH terminal:")), view(&term)], 8.0),
+            (vec![view(&label("Custom command:")), view(&custom)], 0.0),
+            (
+                vec![
+                    empty(),
+                    view(&label(
+                        "Custom command is used only for the “Custom command…” terminal.",
+                    )),
+                ],
+                0.0,
+            ),
+            (
+                vec![
+                    empty(),
+                    view(&label(
+                        "Placeholders: {ssh} = the full ssh command; {host}, {port}, {user} are also available.",
+                    )),
+                ],
+                0.0,
+            ),
+            (
+                vec![
+                    empty(),
+                    view(&label("This terminal is shared by every SSH connection.")),
+                ],
+                0.0,
+            ),
+            (vec![view(&label("Keyboard:")), view(&swap)], 16.0),
+            (
+                vec![
+                    empty(),
+                    view(&label(
+                        "Matches the PC key layout: the key next to the space bar is Alt.",
+                    )),
+                ],
+                0.0,
+            ),
+            (vec![empty(), view(&mac_shortcuts)], 0.0),
+            (vec![view(&label("Speech to text:")), view(&external_stt_paste)], 16.0),
+            (
+                vec![
+                    empty(),
+                    view(&muted(
+                        "Synchronizes macOS clipboard text before inserting it remotely with Ctrl+V.",
+                    )),
+                ],
+                0.0,
+            ),
+            (vec![view(&label("Startup:")), view(&login)], 16.0),
+        ];
         if !crate::login_item::is_supported() {
             login.setEnabled(false);
-            y -= PITCH;
-            let note = self.label(
-                mtm,
-                parent,
-                rect(gx, y, 640.0, ROW_H),
-                "Requires macOS 13 or newer.",
-            );
-            self.muted(&note);
+            rows.push((
+                vec![empty(), view(&muted("Requires macOS 13 or newer."))],
+                0.0,
+            ));
         }
+
+        let grid_rows: Vec<Retained<NSArray<NSView>>> = rows
+            .iter()
+            .map(|(cells, _)| NSArray::from_retained_slice(cells))
+            .collect();
+        let grid = NSGridView::gridViewWithViews(&NSArray::from_retained_slice(&grid_rows), mtm);
+        grid.setRowSpacing(6.0);
+        grid.setColumnSpacing(8.0);
+        grid.setRowAlignment(NSGridRowAlignment::FirstBaseline);
+        grid.columnAtIndex(0)
+            .setXPlacement(NSGridCellPlacement::Trailing);
+        grid.columnAtIndex(1)
+            .setXPlacement(NSGridCellPlacement::Leading);
+        for (i, (_, padding)) in rows.iter().enumerate() {
+            grid.rowAtIndex(i as isize).setTopPadding(*padding);
+        }
+        // The title spans both columns and sits at the leading edge.
+        grid.mergeCellsInHorizontalRange_verticalRange(NSRange::new(0, 2), NSRange::new(0, 1));
+        grid.cellAtColumnIndex_rowIndex(0, 0)
+            .setXPlacement(NSGridCellPlacement::Leading);
+
+        grid.setTranslatesAutoresizingMaskIntoConstraints(false);
+        parent.addSubview(&grid);
+        grid.topAnchor()
+            .constraintEqualToAnchor_constant(&parent.topAnchor(), 20.0)
+            .setActive(true);
+        grid.leadingAnchor()
+            .constraintEqualToAnchor_constant(&parent.leadingAnchor(), 32.0)
+            .setActive(true);
+
+        *self.ivars().terminal.borrow_mut() = Some(term);
+        *self.ivars().custom.borrow_mut() = Some(custom);
+        *self.ivars().swap_cmd_alt.borrow_mut() = Some(swap);
+        *self.ivars().mac_shortcuts.borrow_mut() = Some(mac_shortcuts);
+        *self.ivars().external_stt_paste.borrow_mut() = Some(external_stt_paste);
         *self.ivars().launch_at_login.borrow_mut() = Some(login);
     }
 
@@ -1117,12 +1156,6 @@ impl SettingsController {
         l.setFrame(f);
         parent.addSubview(&l);
         l
-    }
-
-    fn header(&self, mtm: MainThreadMarker, parent: &NSView, y: &mut f64, text: &str) {
-        let l = self.label(mtm, parent, rect(FORM_X, *y, 460.0, 20.0), text);
-        l.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
-        *y -= HDR_PITCH;
     }
 
     /// A right-aligned label for the form's label column (macOS convention).
