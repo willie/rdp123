@@ -185,6 +185,10 @@ pub struct RdpOptions {
     /// Graphics pipeline (EGFX or legacy bitmap updates).
     #[serde(default)]
     pub graphics: GraphicsMode,
+    /// EGFX only: offer AVC444 (the V10.7 capability set). Off falls back to
+    /// AVC420 for servers whose AVC444 stream is broken.
+    #[serde(default = "default_true")]
+    pub avc444: bool,
     #[serde(default)]
     pub scaling: ScalingLevel,
     #[serde(default)]
@@ -227,6 +231,7 @@ impl Default for RdpOptions {
             clipboard: ClipboardMode::default(),
             audio: AudioMode::default(),
             graphics: GraphicsMode::default(),
+            avc444: true,
             scaling: ScalingLevel::default(),
             resolution_mode: ResolutionMode::default(),
             resolution: None,

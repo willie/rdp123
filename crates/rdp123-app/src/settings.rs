@@ -170,6 +170,7 @@ pub struct SettingsIvars {
     remember_size: Check,
     audio: Popup,
     graphics: Popup,
+    avc444: Check,
     reconnect: Check,
     keep_alive: Check,
 
@@ -1020,6 +1021,10 @@ impl SettingsController {
             dirty,
             240.0,
         );
+        let avc444 = checkbox("Use AVC444 (full-color H.264)");
+        avc444.setToolTip(Some(&NSString::from_str(
+            "RDP 8.0 only. When off, the server uses AVC420 instead.",
+        )));
         // This controls the outer FastPath/XCRUSH transport layer in either
         // graphics mode. EGFX additionally manages ZGFX and codec compression.
         let compression = checkbox("Transport compression (recommended)");
@@ -1091,6 +1096,7 @@ impl SettingsController {
             field("Scaling:", &scaling, Rdp),
             field("Color quality:", &color, Rdp),
             field("Graphics:", &graphics, Rdp),
+            control(&avc444, Rdp),
             control(&compression, Rdp),
             control(&fullscreen, Rdp),
             control(&remember_size, Rdp),
@@ -1268,6 +1274,7 @@ impl SettingsController {
         *ivars.scaling.borrow_mut() = Some(scaling);
         *ivars.color.borrow_mut() = Some(color);
         *ivars.graphics.borrow_mut() = Some(graphics);
+        *ivars.avc444.borrow_mut() = Some(avc444);
         *ivars.compression.borrow_mut() = Some(compression);
         *ivars.fullscreen.borrow_mut() = Some(fullscreen);
         *ivars.remember_size.borrow_mut() = Some(remember_size);
@@ -1858,6 +1865,7 @@ impl SettingsController {
             self.set_check(&iv.remember_size, c.rdp.remember_size);
             self.set_popup(&iv.audio, index_of(&AUDIO, &c.rdp.audio));
             self.set_popup(&iv.graphics, index_of(&GRAPHICS, &c.rdp.graphics));
+            self.set_check(&iv.avc444, c.rdp.avc444);
             self.set_check(&iv.reconnect, c.rdp.reconnect);
             self.set_check(&iv.keep_alive, c.rdp.keep_alive);
         } else {
@@ -1943,6 +1951,7 @@ impl SettingsController {
         let remember_size = self.check_on(&iv.remember_size);
         let audio = AUDIO[self.popup_index(&iv.audio).clamp(0, 2) as usize];
         let graphics = GRAPHICS[self.popup_index(&iv.graphics).clamp(0, 1) as usize];
+        let avc444 = self.check_on(&iv.avc444);
         let reconnect = self.check_on(&iv.reconnect);
         let keep_alive = self.check_on(&iv.keep_alive);
         let password = self.read_secure(&iv.password);
@@ -1997,6 +2006,7 @@ impl SettingsController {
         connection.rdp.remember_size = remember_size;
         connection.rdp.audio = audio;
         connection.rdp.graphics = graphics;
+        connection.rdp.avc444 = avc444;
         connection.rdp.reconnect = reconnect;
         connection.rdp.keep_alive = keep_alive;
         connection.rdp.password_policy = pw_policy;

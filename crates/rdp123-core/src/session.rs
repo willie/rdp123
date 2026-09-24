@@ -977,6 +977,8 @@ pub struct SessionConfig {
     pub audio: AudioMode,
     /// Graphics pipeline: EGFX (H.264/RemoteFX Progressive) or legacy bitmaps.
     pub graphics: GraphicsMode,
+    /// EGFX only: offer AVC444. When false the server falls back to AVC420.
+    pub avc444: bool,
     /// When false, the remote stays at a fixed resolution (window resizes just scale it).
     pub dynamic_resolution: bool,
     pub reconnect: bool,
@@ -1898,7 +1900,7 @@ async fn connect(
                 Box::new(crate::videotoolbox::VideoToolboxDecoder::new())
             };
         let decoder = Some(decoder);
-        let handler = crate::gfx::GfxHandler::new(framebuffer.clone(), gfx_tx);
+        let handler = crate::gfx::GfxHandler::new(framebuffer.clone(), gfx_tx, config.avc444);
         drdynvc = drdynvc.with_dynamic_channel(ironrdp_egfx::client::GraphicsPipelineClient::new(
             Box::new(handler),
             decoder,
@@ -3303,6 +3305,7 @@ mod tests {
             clipboard: ClipboardMode::Disabled,
             audio: AudioMode::Never,
             graphics,
+            avc444: true,
             dynamic_resolution: false,
             reconnect: false,
             reconnect_per_minute: 0,

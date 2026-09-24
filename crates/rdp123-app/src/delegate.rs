@@ -488,6 +488,7 @@ impl AppDelegate {
             clipboard: opts.clipboard,
             audio: opts.audio,
             graphics: opts.graphics,
+            avc444: opts.avc444,
             dynamic_resolution: controller.dynamic_resolution(),
             reconnect: opts.reconnect,
             reconnect_per_minute: opts.reconnect_per_minute,

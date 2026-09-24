@@ -150,10 +150,16 @@ pub struct GfxHandler {
     /// `RDP123_EGFX_CAPTURE=<file>`: append every WireToSurface2 progressive
     /// stream (length-prefixed) for offline replay and analysis.
     capture: Option<std::fs::File>,
+    /// Offer the V10.7 capability set (AVC444).
+    avc444: bool,
 }
 
 impl GfxHandler {
-    pub fn new(framebuffer: Arc<SharedFramebuffer>, events: UnboundedSender<GfxEvent>) -> Self {
+    pub fn new(
+        framebuffer: Arc<SharedFramebuffer>,
+        events: UnboundedSender<GfxEvent>,
+        avc444: bool,
+    ) -> Self {
         let dump_dir = std::env::var_os("RDP123_DEBUG_DUMP").map(std::path::PathBuf::from);
         if let Some(dir) = &dump_dir {
             match std::fs::create_dir_all(dir) {
@@ -202,6 +208,7 @@ impl GfxHandler {
             dump_dir,
             flush_count: std::cell::Cell::new(0),
             capture,
+            avc444,
         }
     }
 
@@ -552,19 +559,21 @@ impl GraphicsPipelineHandler for GfxHandler {
     /// decodes in its v2 layout (the one GNOME Remote Desktop sends); the
     /// client drops the set if the H.264 decoder can't return YUV420 planes.
     /// V8.1 keeps RemoteFX Progressive, ClearCodec, planar and AVC420; V8 is
-    /// the no-AVC fallback.
+    /// the no-AVC fallback. With AVC444 turned off, V10.7 is not offered.
     fn capabilities(&self) -> Vec<CapabilitySet> {
-        vec![
-            CapabilitySet::V10_7 {
+        let mut caps = Vec::with_capacity(3);
+        if self.avc444 {
+            caps.push(CapabilitySet::V10_7 {
                 flags: CapabilitiesV107Flags::SMALL_CACHE,
-            },
-            CapabilitySet::V8_1 {
-                flags: CapabilitiesV81Flags::AVC420_ENABLED | CapabilitiesV81Flags::SMALL_CACHE,
-            },
-            CapabilitySet::V8 {
-                flags: CapabilitiesV8Flags::SMALL_CACHE,
-            },
-        ]
+            });
+        }
+        caps.push(CapabilitySet::V8_1 {
+            flags: CapabilitiesV81Flags::AVC420_ENABLED | CapabilitiesV81Flags::SMALL_CACHE,
+        });
+        caps.push(CapabilitySet::V8 {
+            flags: CapabilitiesV8Flags::SMALL_CACHE,
+        });
+        caps
     }
 
     fn on_capabilities_confirmed(&mut self, caps: &CapabilitySet) {
@@ -1051,7 +1060,7 @@ mod tests {
     fn handler_with_surface(w: u16, h: u16) -> GfxHandler {
         let (tx, _rx) = unbounded_channel();
         // Keep the receiver alive is unnecessary: send errors are ignored.
-        let mut handler = GfxHandler::new(SharedFramebuffer::new(), tx);
+        let mut handler = GfxHandler::new(SharedFramebuffer::new(), tx, true);
         handler.surfaces.insert(0, SurfaceBuf::new(w, h));
         handler
     }
@@ -1063,6 +1072,17 @@ mod tests {
             right,
             bottom,
         }
+    }
+
+    #[test]
+    fn avc444_off_drops_v10_7() {
+        let (tx, _rx) = unbounded_channel();
+        let on = GfxHandler::new(SharedFramebuffer::new(), tx.clone(), true).capabilities();
+        let off = GfxHandler::new(SharedFramebuffer::new(), tx, false).capabilities();
+        assert!(matches!(on[0], CapabilitySet::V10_7 { .. }));
+        assert_eq!(off.len(), on.len() - 1);
+        assert!(!off.iter().any(|c| matches!(c, CapabilitySet::V10_7 { .. })));
+        assert!(matches!(off[0], CapabilitySet::V8_1 { .. }));
     }
 
     #[test]

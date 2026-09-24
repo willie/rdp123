@@ -64,7 +64,7 @@ fn main() {
 
     let framebuffer = SharedFramebuffer::new();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut handler = GfxHandler::new(framebuffer.clone(), tx);
+    let mut handler = GfxHandler::new(framebuffer.clone(), tx, true);
 
     let mut r = Reader {
         data: &data,
