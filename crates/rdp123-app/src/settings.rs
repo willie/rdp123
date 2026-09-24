@@ -27,7 +27,8 @@ use objc2_app_kit::{
     NSControlStateValueOn, NSControlTextEditingDelegate, NSFont, NSFontAttributeName, NSGridCell,
     NSGridCellPlacement, NSGridRow, NSGridRowAlignment, NSGridView, NSImage, NSImageName,
     NSImageNameAddTemplate, NSImageNameRemoveTemplate, NSImageScaling, NSImageView,
-    NSLayoutAttribute, NSLineBreakMode, NSLinkAttributeName, NSObjectNSKeyValueBindingCreation,
+    NSLayoutAttribute, NSLineBreakMode, NSLinkAttributeName, NSMenu, NSMenuItem,
+    NSMenuItemValidation, NSObjectNSKeyValueBindingCreation,
     NSPasteboard, NSPasteboardTypeString, NSPopUpButton, NSScreen, NSScrollView, NSSecureTextField,
     NSStackView, NSStackViewDistribution, NSStackViewGravity, NSTabView, NSTabViewController,
     NSTabViewControllerTabStyle, NSTabViewItem, NSTableCellView, NSTableColumn, NSTableView,
@@ -109,6 +110,32 @@ fn fitted_frame(frame: CGRect, chrome: f64, wanted: f64, visible: CGRect) -> CGR
 
 fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
     CGRect::new(CGPoint::new(x, y), CGSize::new(w, h))
+}
+
+/// Finder-style name for a duplicate: "Name copy", then "Name copy 2", …,
+/// skipping names already in use. Copying a copy counts up from the same
+/// base rather than stacking "copy copy".
+fn copy_name(name: &str, existing: &[Connection]) -> String {
+    let base = match name.rsplit_once(" copy") {
+        Some((base, rest))
+            if !base.is_empty()
+                && (rest.is_empty()
+                    || rest
+                        .strip_prefix(' ')
+                        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))) =>
+        {
+            base
+        }
+        _ => name,
+    };
+    let taken = |candidate: &str| existing.iter().any(|c| c.name == candidate);
+    let mut candidate = format!("{base} copy");
+    let mut n = 2;
+    while taken(&candidate) {
+        candidate = format!("{base} copy {n}");
+        n += 1;
+    }
+    candidate
 }
 
 fn index_of<T: PartialEq>(items: &[T], value: &T) -> isize {
@@ -253,6 +280,20 @@ define_class!(
         }
     }
 
+    unsafe impl NSMenuItemValidation for SettingsController {
+        /// Duplicate and Delete need a row: the right-clicked one in the
+        /// list's context menu, the selected one from the File menu (⌘D).
+        #[unsafe(method(validateMenuItem:))]
+        fn validate_menu_item(&self, item: &NSMenuItem) -> bool {
+            let row = if self.is_context_item(item) {
+                self.clicked_row()
+            } else {
+                self.ivars().selected.get()
+            };
+            self.pane() == 0 && row >= 0
+        }
+    }
+
     impl SettingsController {
         #[unsafe(method(addConnection:))]
         fn add(&self, _s: Option<&AnyObject>) {
@@ -280,9 +321,47 @@ define_class!(
             }
         }
 
+        /// Copy the selected connection, saved password included, to a new
+        /// row right below it, then put the cursor in the copy's name.
+        #[unsafe(method(duplicateConnection:))]
+        fn duplicate(&self, sender: Option<&AnyObject>) {
+            if !self.select_context_row(sender) || !self.confirm_discard_ok() {
+                return;
+            }
+            let row = self.ivars().selected.get();
+            if row < 0 {
+                return;
+            }
+            let mut document = self.ivars().document.borrow().clone();
+            let original = document.connections[row as usize].clone();
+            let copy = original.duplicate(copy_name(&original.name, &document.connections));
+            let new_index = row + 1;
+            document.connections.insert(new_index as usize, copy.clone());
+            if !self.save_document(&document) {
+                return;
+            }
+            *self.ivars().document.borrow_mut() = document;
+            let copied = secrets::load_password(&original.id).and_then(|password| match password {
+                Some(p) => secrets::store_password(&copy.id, &p),
+                None => Ok(()),
+            });
+            if let Err(error) = copied {
+                ui::show_error(self.mtm(), "Could not copy saved password", &format!("{error:#}"));
+            }
+            self.ivars().selected.set(-1);
+            self.reload_table();
+            self.select_row(new_index);
+            if let (Some(w), Some(name)) = (
+                self.ivars().window.borrow().as_ref(),
+                self.ivars().name.borrow().as_ref(),
+            ) {
+                w.makeFirstResponder(Some(name));
+            }
+        }
+
         #[unsafe(method(removeConnection:))]
-        fn remove(&self, _s: Option<&AnyObject>) {
-            if !self.confirm_discard_ok() {
+        fn remove(&self, sender: Option<&AnyObject>) {
+            if !self.select_context_row(sender) || !self.confirm_discard_ok() {
                 return;
             }
             let row = self.ivars().selected.get();
@@ -791,6 +870,25 @@ impl SettingsController {
             table.setDataSource(Some(ProtocolObject::from_ref(self)));
             table.setDelegate(Some(ProtocolObject::from_ref(self)));
         }
+        // Right-click a row for Duplicate / Delete; `validateMenuItem:`
+        // disables both over empty space.
+        let context = NSMenu::new(mtm);
+        for (title, action) in [
+            ("Duplicate", sel!(duplicateConnection:)),
+            ("Delete", sel!(removeConnection:)),
+        ] {
+            let item = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &NSString::from_str(title),
+                    Some(action),
+                    &NSString::new(),
+                )
+            };
+            unsafe { item.setTarget(Some(self.any())) };
+            context.addItem(&item);
+        }
+        unsafe { table.setMenu(Some(&context)) };
         scroll.setDocumentView(Some(&table));
         // The one column spans the list, so names use the full row width.
         table.sizeLastColumnToFit();
@@ -1549,6 +1647,37 @@ impl SettingsController {
         }
     }
 
+    /// The row under the pointer when the list's context menu opened, or -1.
+    fn clicked_row(&self) -> isize {
+        self.ivars().table.borrow().as_ref().map(|t| t.clickedRow()).unwrap_or(-1)
+    }
+
+    fn is_context_item(&self, item: &NSMenuItem) -> bool {
+        let table_menu = self.ivars().table.borrow().as_ref().and_then(|t| t.menu());
+        matches!((unsafe { item.menu() }, table_menu), (Some(a), Some(b)) if a == b)
+    }
+
+    /// For an action sent from the list's context menu, select the
+    /// right-clicked row first, as a click would (asking about unsaved
+    /// edits). Returns false if that was cancelled.
+    fn select_context_row(&self, sender: Option<&AnyObject>) -> bool {
+        let Some(item) = sender.and_then(|s| s.downcast_ref::<NSMenuItem>()) else {
+            return true;
+        };
+        if !self.is_context_item(item) {
+            return true;
+        }
+        let row = self.clicked_row();
+        if row < 0 || row == self.ivars().selected.get() {
+            return true;
+        }
+        if !self.confirm_discard_ok() {
+            return false;
+        }
+        self.select_row(row);
+        true
+    }
+
     fn reload_table(&self) {
         if let Some(t) = self.ivars().table.borrow().as_ref() {
             t.reloadData();
@@ -2093,7 +2222,43 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{fitted_frame, rect};
+    use super::{copy_name, fitted_frame, rect};
+    use rdp123_core::{Connection, ConnectionKind};
+
+    fn named(names: &[&str]) -> Vec<Connection> {
+        names
+            .iter()
+            .map(|n| Connection::new(*n, ConnectionKind::Rdp))
+            .collect()
+    }
+
+    #[test]
+    fn a_copy_is_named_like_finder_names_one() {
+        assert_eq!(copy_name("Work PC", &named(&["Work PC"])), "Work PC copy");
+        assert_eq!(
+            copy_name("Work PC", &named(&["Work PC", "Work PC copy"])),
+            "Work PC copy 2"
+        );
+        assert_eq!(
+            copy_name("Work PC", &named(&["Work PC", "Work PC copy", "Work PC copy 2"])),
+            "Work PC copy 3"
+        );
+    }
+
+    #[test]
+    fn copying_a_copy_counts_up_instead_of_stacking() {
+        let existing = named(&["Work PC", "Work PC copy"]);
+        assert_eq!(copy_name("Work PC copy", &existing), "Work PC copy 2");
+        let existing = named(&["Work PC", "Work PC copy", "Work PC copy 2"]);
+        assert_eq!(copy_name("Work PC copy 2", &existing), "Work PC copy 3");
+    }
+
+    #[test]
+    fn copy_inside_a_name_is_not_a_suffix() {
+        assert_eq!(copy_name("copy", &named(&["copy"])), "copy copy");
+        assert_eq!(copy_name("Photocopy lab", &named(&[])), "Photocopy lab copy");
+        assert_eq!(copy_name("Box copy B", &named(&[])), "Box copy B copy");
+    }
 
     // A laptop-sized screen: 830 pt usable above an 70 pt Dock (y-up).
     fn visible() -> objc2_core_foundation::CGRect {

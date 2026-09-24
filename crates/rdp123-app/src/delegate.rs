@@ -723,9 +723,12 @@ fn install_main_menu(mtm: MainThreadMarker) {
 
     // File menu: Close ⌘W for the Settings window. Session windows answer
     // `performClose:` themselves and send ⌘W to the remote instead.
+    // Duplicate ⌘D reaches the Settings controller as its window's delegate;
+    // with any other window key nothing answers it, so ⌘D passes through.
     let file_slot = NSMenuItem::new(mtm);
     let file_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("File"));
     file_menu.addItem(&item(mtm, "Close", sel!(performClose:), "w"));
+    file_menu.addItem(&item(mtm, "Duplicate", sel!(duplicateConnection:), "d"));
     file_slot.setSubmenu(Some(&file_menu));
     main_menu.addItem(&file_slot);
 

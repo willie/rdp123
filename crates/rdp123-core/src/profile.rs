@@ -287,6 +287,18 @@ impl Connection {
         }
     }
 
+    /// A copy under a new id and name. The pinned fingerprint belongs to
+    /// this connection's host and is not carried over; the copy is usually
+    /// pointed somewhere else, so it pins on its first connect.
+    pub fn duplicate(&self, name: impl Into<String>) -> Self {
+        Self {
+            id: new_id(),
+            name: name.into(),
+            cert_fingerprint: None,
+            ..self.clone()
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         validate_label("connection id", &self.id)?;
         validate_label("connection name", &self.name)?;
@@ -648,6 +660,29 @@ mod tests {
         document.connections.truncate(1);
         document.connections[0].host = "-oProxyCommand=evil".to_string();
         assert!(format!("{:#}", document.validate().unwrap_err()).contains("must not start"));
+    }
+
+    #[test]
+    fn a_duplicate_gets_a_new_id_and_no_pinned_fingerprint() {
+        let mut original = Connection::new("Office", ConnectionKind::Rdp);
+        original.host = "server.example".to_string();
+        original.username = "willie".to_string();
+        original.cert_fingerprint = Some("ab:cd".to_string());
+        original.rdp.fullscreen = true;
+
+        let copy = original.duplicate("Office copy");
+        assert_ne!(copy.id, original.id);
+        assert_eq!(copy.name, "Office copy");
+        assert_eq!(copy.cert_fingerprint, None);
+        assert_eq!(copy.host, original.host);
+        assert_eq!(copy.username, original.username);
+        assert!(copy.rdp.fullscreen);
+
+        let document = Document {
+            connections: vec![original, copy],
+            ..Document::default()
+        };
+        document.validate().unwrap();
     }
 
     #[test]
