@@ -1742,7 +1742,7 @@ impl SettingsController {
         };
         connection.name = name;
         connection.kind = kind;
-        connection.host = host;
+        connection.set_host(host);
         connection.port = port;
         connection.username = user;
         connection.domain = if authentication == AuthenticationMode::EntraWeb || domain.is_empty() {
