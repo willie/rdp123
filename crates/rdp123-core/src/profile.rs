@@ -304,6 +304,16 @@ impl Connection {
         }
     }
 
+    /// Point the connection at `host`. The pinned fingerprint belongs to the
+    /// old host, so a different host drops it and pins on its next connect.
+    pub fn set_host(&mut self, host: impl Into<String>) {
+        let host = host.into();
+        if !host.eq_ignore_ascii_case(&self.host) {
+            self.cert_fingerprint = None;
+        }
+        self.host = host;
+    }
+
     pub fn validate(&self) -> Result<()> {
         validate_label("connection id", &self.id)?;
         validate_label("connection name", &self.name)?;
@@ -647,6 +657,20 @@ mod tests {
             },
             dir,
         )
+    }
+
+    #[test]
+    fn changing_the_host_drops_the_pinned_fingerprint() {
+        let mut connection = Connection::new("Office", ConnectionKind::Rdp);
+        connection.host = "server.example".to_string();
+        connection.cert_fingerprint = Some("ab:cd".to_string());
+
+        connection.set_host("SERVER.example");
+        assert_eq!(connection.cert_fingerprint.as_deref(), Some("ab:cd"));
+
+        connection.set_host("other.example");
+        assert_eq!(connection.host, "other.example");
+        assert_eq!(connection.cert_fingerprint, None);
     }
 
     #[test]
