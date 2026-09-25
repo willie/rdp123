@@ -165,7 +165,10 @@ ironrdp-graphics = { path = "vendor/ironrdp-graphics" }
 #   (backport of upstream 9542e017, #1923, unreleased as of 0.3.0).
 # - AVC444v2 is decoded (port of the upstream AVC444 change, not yet a PR).
 ironrdp-egfx = { path = "vendor/ironrdp-egfx" }
-# ironrdp-session 0.11.0 from crates.io, vendored to crop classic bitmap updates
-# to their destination rectangle. Upstream reads rows of the rectangle's width,
-# so a bitmap wider than its rectangle (xrdp pads the width) renders sheared.
+# ironrdp-session 0.11.0 from crates.io, vendored for:
+# - Classic bitmap updates are cropped to their destination rectangle.
+#   Upstream reads rows of the rectangle's width, so a bitmap wider than its
+#   rectangle (xrdp pads the width) renders sheared.
+# - GracefulDisconnectReason has an ErrorInfo variant holding the server's
+#   error-info code; upstream flattens it into a string.
 ironrdp-session = { path = "vendor/ironrdp-session" }

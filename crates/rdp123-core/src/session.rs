@@ -48,11 +48,14 @@ use ironrdp::pdu::geometry::Rectangle as _;
 use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 use ironrdp::pdu::rdp::capability_sets::{client_codecs_capabilities, MajorPlatformType};
 use ironrdp::pdu::rdp::client_info::{CompressionType, PerformanceFlags, TimezoneInfo};
+use ironrdp::pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode};
 use ironrdp::pdu::PduResult;
 use ironrdp::rdpdr::{NoopRdpdrBackend, Rdpdr};
 use ironrdp::rdpsnd::client::Rdpsnd;
 use ironrdp::session::image::DecodedImage;
-use ironrdp::session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput};
+use ironrdp::session::{
+    ActiveStage, ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason,
+};
 use ironrdp_tokio::{
     connect_begin, connect_finalize, mark_as_upgraded, single_sequence_step_read,
     split_tokio_framed, FramedWrite as _, NetworkClient, TokioFramed,
@@ -1215,7 +1218,7 @@ enum SessionEnd {
     UserQuit,
     /// The server ended the session on purpose (sign-out, another client took
     /// the session, idle or admin disconnect) — do not reconnect.
-    RemoteEnded,
+    RemoteEnded(GracefulDisconnectReason),
     /// Connection dropped — reconnect if enabled.
     Disconnected(String),
 }
@@ -1391,8 +1394,8 @@ async fn run(
                 .await
                 {
                     SessionEnd::UserQuit => Outcome::Stop,
-                    SessionEnd::RemoteEnded => Outcome::Fail {
-                        reason: REMOTE_ENDED.to_string(),
+                    SessionEnd::RemoteEnded(reason) => Outcome::Fail {
+                        reason: remote_end_message(&reason),
                         event: TerminalEvent::Disconnected,
                     },
                     SessionEnd::Disconnected(reason) => {
@@ -1702,8 +1705,8 @@ async fn run_session(
                     )
                     .await
                     {
-                        Ok(true) => break SessionEnd::RemoteEnded,
-                        Ok(false) => {}
+                        Ok(Some(reason)) => break SessionEnd::RemoteEnded(reason),
+                        Ok(None) => {}
                         Err(error) => break SessionEnd::Disconnected(format!("{error:#}")),
                     },
                     Err(error) => break SessionEnd::Disconnected(format!("{error:#}")),
@@ -1748,8 +1751,8 @@ async fn run_session(
                             &mut remote_clip,
                             event_cb,
                         ).await {
-                            Ok(true) => break SessionEnd::RemoteEnded,
-                            Ok(false) => {
+                            Ok(Some(reason)) => break SessionEnd::RemoteEnded(reason),
+                            Ok(None) => {
                                 if is_external_paste {
                                     last_input = tokio::time::Instant::now();
                                     keys_down = 0;
@@ -1793,8 +1796,8 @@ async fn run_session(
                     &mut reader, &out_tx, &mut active_stage, &mut image,
                     &activation_factory, &mut input_db, framebuffer, event_cb,
                 ).await {
-                    Ok(true) => break SessionEnd::RemoteEnded,
-                    Ok(false) => {}
+                    Ok(Some(reason)) => break SessionEnd::RemoteEnded(reason),
+                    Ok(None) => {}
                     Err(e) => break SessionEnd::Disconnected(format!("{e:#}")),
                 }
                 last_input = tokio::time::Instant::now();
@@ -1813,8 +1816,8 @@ async fn run_session(
                             framebuffer,
                             event_cb,
                         ).await {
-                            Ok(true) => break SessionEnd::RemoteEnded,
-                            Ok(false) => {}
+                            Ok(Some(reason)) => break SessionEnd::RemoteEnded(reason),
+                            Ok(None) => {}
                             Err(e) => break SessionEnd::Disconnected(format!("{e:#}")),
                         },
                         Err(e) => break SessionEnd::Disconnected(format!("{e:#}")),
@@ -2172,7 +2175,8 @@ async fn handle_command(
                     framebuffer,
                     event_cb,
                 )
-                .await;
+                .await
+                .map(|ended| ended.is_some());
             }
         }
         SessionCommand::Resize {
@@ -2243,7 +2247,8 @@ async fn handle_command(
                     framebuffer,
                     event_cb,
                 )
-                .await;
+                .await
+                .map(|ended| ended.is_some());
             }
         }
         SessionCommand::Shutdown => {
@@ -2272,18 +2277,18 @@ async fn handle_clip_signal(
     local_clip: &LocalClipState,
     remote_clip: &mut RemoteClipboard,
     event_cb: &EventCb,
-) -> Result<bool> {
+) -> Result<Option<GracefulDisconnectReason>> {
     match sig {
         ClipSignal::InitializeClipboard => {
             let formats = local_clip.lock().unwrap().begin_initial_offer();
             if let Some(formats) = formats {
                 send_cliprdr(active_stage, out_tx, |c| c.initiate_copy(&formats)).await?;
             }
-            Ok(false)
+            Ok(None)
         }
         ClipSignal::AdvertiseLocal { generation } => {
             advertise_local_clipboard(generation, local_clip, active_stage, out_tx).await?;
-            Ok(false)
+            Ok(None)
         }
         ClipSignal::PasteAccepted { generation } => {
             if !local_clip
@@ -2292,7 +2297,7 @@ async fn handle_clip_signal(
                 .consume_confirmed_paste(generation)
             {
                 tracing::debug!(generation, "clipboard: cancelled stale external STT paste");
-                return Ok(false);
+                return Ok(None);
             }
             tracing::debug!(
                 generation,
@@ -2324,15 +2329,15 @@ async fn handle_clip_signal(
                 advertise_local_clipboard(deferred_generation, local_clip, active_stage, out_tx)
                     .await?;
             }
-            Ok(false)
+            Ok(None)
         }
         ClipSignal::SubmitFileContents(response) => {
             send_cliprdr(active_stage, out_tx, |c| c.submit_file_contents(response)).await?;
-            Ok(false)
+            Ok(None)
         }
         ClipSignal::InitiatePaste(format) => {
             send_cliprdr(active_stage, out_tx, |c| c.initiate_paste(format)).await?;
-            Ok(false)
+            Ok(None)
         }
         ClipSignal::SubmitData {
             response,
@@ -2352,11 +2357,11 @@ async fn handle_clip_signal(
                     .await?;
                 }
             }
-            Ok(false)
+            Ok(None)
         }
         ClipSignal::RemoteText(text) => {
             event_cb(SessionEvent::ClipboardText(text));
-            Ok(false)
+            Ok(None)
         }
         ClipSignal::RemoteFileList { files, data_id } => {
             // A newer Windows clipboard offer supersedes any partial cache
@@ -2372,7 +2377,7 @@ async fn handle_clip_signal(
                 .map(|f| f.wire_name.clone())
                 .collect();
             if names.is_empty() {
-                return Ok(false);
+                return Ok(None);
             }
 
             event_cb(SessionEvent::ClipboardFilesPreparing { count: names.len() });
@@ -2392,7 +2397,7 @@ async fn handle_clip_signal(
                     event_cb(SessionEvent::ClipboardFilesFailed(reason));
                 }
             }
-            Ok(false)
+            Ok(None)
         }
         ClipSignal::RemoteFileContents { stream_id, data } => {
             handle_remote_file_contents(
@@ -2404,7 +2409,7 @@ async fn handle_clip_signal(
                 event_cb,
             )
             .await;
-            Ok(false)
+            Ok(None)
         }
     }
 }
@@ -2460,7 +2465,8 @@ where
     Ok(())
 }
 
-/// Apply every `ActiveStageOutput`. Returns `Ok(true)` when the session should end.
+/// Apply every `ActiveStageOutput`. Returns the server's reason when it ended
+/// the session.
 async fn drain_outputs(
     outputs: Vec<ActiveStageOutput>,
     reader: &mut SessionReader,
@@ -2470,7 +2476,7 @@ async fn drain_outputs(
     image: &mut DecodedImage,
     framebuffer: &SharedFramebuffer,
     event_cb: &EventCb,
-) -> Result<bool> {
+) -> Result<Option<GracefulDisconnectReason>> {
     for output in outputs {
         match output {
             ActiveStageOutput::ResponseFrame(frame) => emit(out_tx, frame).await?,
@@ -2499,7 +2505,7 @@ async fn drain_outputs(
             }
             ActiveStageOutput::Terminate(reason) => {
                 tracing::info!("server ended the session: {reason}");
-                return Ok(true);
+                return Ok(Some(reason));
             }
             // Pointer shapes are mirrored onto the native macOS cursor so the
             // remote shape (resize arrows, I-beam, hand) shows without the
@@ -2522,7 +2528,7 @@ async fn drain_outputs(
             | ActiveStageOutput::AutoDetect(_) => {}
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 /// Drive a Deactivation-Reactivation sequence (e.g. a server-side resolution
@@ -2629,8 +2635,9 @@ fn update_keys_down(cmd: &SessionCommand, keys_down: u32) -> u32 {
 }
 
 /// Inject a single invisible F15 tap (down+up) straight into the FastPath input
-/// stream, bypassing the mac→scancode keymap. Returns `Ok(true)` if flushing the
-/// tap revealed that the remote had already ended. Used by the idle keep-alive.
+/// stream, bypassing the mac→scancode keymap. Returns the server's reason if
+/// flushing the tap revealed that the remote had already ended. Used by the
+/// idle keep-alive.
 #[allow(clippy::too_many_arguments)]
 async fn send_keepalive_tap(
     reader: &mut SessionReader,
@@ -2641,14 +2648,14 @@ async fn send_keepalive_tap(
     input_db: &mut Database,
     framebuffer: &SharedFramebuffer,
     event_cb: &EventCb,
-) -> Result<bool> {
+) -> Result<Option<GracefulDisconnectReason>> {
     let scan = Scancode::from_u8(false, KEEP_ALIVE_SCANCODE);
     let fp_events = input_db.apply(vec![
         Operation::KeyPressed(scan),
         Operation::KeyReleased(scan),
     ]);
     if fp_events.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
     let outputs = active_stage.process_fastpath_input(image, &fp_events)?;
     drain_outputs(
@@ -2692,7 +2699,7 @@ async fn send_remote_clipboard_paste(
     input_db: &mut Database,
     framebuffer: &SharedFramebuffer,
     event_cb: &EventCb,
-) -> Result<bool> {
+) -> Result<Option<GracefulDisconnectReason>> {
     let fp_events = remote_clipboard_paste_input_events(input_db);
     let outputs = active_stage.process_fastpath_input(image, &fp_events)?;
     drain_outputs(
@@ -2910,6 +2917,33 @@ fn connector_credentials_rejected(kind: &ConnectorErrorKind) -> bool {
         ),
         _ => false,
     }
+}
+
+/// Message for a session the server ended. A logoff or disconnect the user
+/// chose maps to `REMOTE_ENDED`, which closes the window without a dialog.
+fn remote_end_message(reason: &GracefulDisconnectReason) -> String {
+    let description = match reason {
+        GracefulDisconnectReason::UserInitiated
+        | GracefulDisconnectReason::ServerInitiated
+        | GracefulDisconnectReason::ErrorInfo(ErrorInfo::ProtocolIndependentCode(
+            ProtocolIndependentCode::LogoffByUser
+            | ProtocolIndependentCode::RpcInitiatedDisconnectByuser,
+        )) => return REMOTE_ENDED.to_string(),
+        GracefulDisconnectReason::ErrorInfo(ErrorInfo::ProtocolIndependentCode(code)) => {
+            code.description()
+        }
+        GracefulDisconnectReason::ErrorInfo(ErrorInfo::ProtocolIndependentLicensingCode(code)) => {
+            code.description()
+        }
+        GracefulDisconnectReason::ErrorInfo(
+            ErrorInfo::ProtocolIndependentConnectionBrokerCode(code),
+        ) => code.description(),
+        GracefulDisconnectReason::ErrorInfo(ErrorInfo::RdpSpecificCode(code)) => code.description(),
+        GracefulDisconnectReason::Other(description) => {
+            return format!("The server ended the session ({description}).");
+        }
+    };
+    format!("{description}.")
 }
 
 fn user_facing_disconnect_reason(reason: &str) -> String {
@@ -3333,12 +3367,12 @@ mod tests {
         absorb_offline_command, apply_remote_file_contents, build_config, connector_failure,
         create_remote_clipboard_cache_dir, initial_keyboard_sync_event, mdns_fallback_hostname,
         next_remote_fetch_action, normalize_clipboard_to_crlf, plan_remote_clipboard_cache,
-        remote_clipboard_paste_input_events, remote_top_level_destination, resolve_pending_command,
-        security_mismatch_message, to_file_descriptors, update_keys_down,
+        remote_clipboard_paste_input_events, remote_end_message, remote_top_level_destination,
+        resolve_pending_command, security_mismatch_message, to_file_descriptors, update_keys_down,
         user_facing_disconnect_reason, validate_remote_file_range, ClipSignal, InputEvent,
         LocalClip, LocalClipFile, LocalClipState, LocalClipboardOfferResult, LocalClipboardState,
         MacClipboardBackend, PendingCommands, RemoteClipboard, RemoteFetchAction, RemoteFileEntry,
-        SessionCommand, SessionConfig, SessionHandle, CLIPBOARD_RETRY_DELAYS,
+        SessionCommand, SessionConfig, SessionHandle, CLIPBOARD_RETRY_DELAYS, REMOTE_ENDED,
     };
     use crate::profile::{AudioMode, AuthenticationMode, ClipboardMode, GraphicsMode};
     use ironrdp::cliprdr::backend::CliprdrBackend;
@@ -3352,6 +3386,8 @@ mod tests {
     use ironrdp::input::{Database, Operation, Scancode};
     use ironrdp::pdu::input::fast_path::{FastPathInputEvent, KeyboardFlags, SynchronizeFlags};
     use ironrdp::pdu::rdp::client_info::CompressionType;
+    use ironrdp::pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode};
+    use ironrdp::session::GracefulDisconnectReason;
     use ironrdp::svc::{SvcMessage, SvcProcessor};
     use std::sync::atomic::Ordering;
 
@@ -4166,6 +4202,38 @@ mod tests {
         assert!(failure.credentials_rejected());
         let (_, retryable) = failure.into_parts();
         assert!(retryable);
+    }
+
+    #[test]
+    fn user_logoff_ends_without_a_message() {
+        for reason in [
+            GracefulDisconnectReason::UserInitiated,
+            GracefulDisconnectReason::ServerInitiated,
+            GracefulDisconnectReason::ErrorInfo(ErrorInfo::ProtocolIndependentCode(
+                ProtocolIndependentCode::LogoffByUser,
+            )),
+            GracefulDisconnectReason::ErrorInfo(ErrorInfo::ProtocolIndependentCode(
+                ProtocolIndependentCode::RpcInitiatedDisconnectByuser,
+            )),
+        ] {
+            assert_eq!(remote_end_message(&reason), REMOTE_ENDED, "{reason:?}");
+        }
+    }
+
+    #[test]
+    fn server_error_info_is_shown() {
+        assert_eq!(
+            remote_end_message(&GracefulDisconnectReason::ErrorInfo(
+                ErrorInfo::ProtocolIndependentCode(ProtocolIndependentCode::IdleTimeout)
+            )),
+            "The idle session limit timer on the server has elapsed."
+        );
+        assert_eq!(
+            remote_end_message(&GracefulDisconnectReason::Other(
+                "domain disconnected".to_owned()
+            )),
+            "The server ended the session (domain disconnected)."
+        );
     }
 
     #[test]
