@@ -1191,6 +1191,10 @@ enum ClipSignal {
 
 /// Give up after this many consecutive failed reconnect attempts.
 const MAX_RECONNECT_FAILURES: u32 = 20;
+/// Give up on the reconnect run at this many credential rejections. One
+/// retry covers a host that briefly refuses sign-in while rebooting; more
+/// risks an account lockout.
+const MAX_RECONNECT_CREDENTIAL_REJECTIONS: u32 = 2;
 /// Attempts for the very first connect. A few retries let a just-granted macOS
 /// Local Network permission (or a transient blip) succeed instead of failing.
 const MAX_INITIAL_FAILURES: u32 = 4;
@@ -1235,6 +1239,10 @@ enum TerminalEvent {
 
 enum ConnectFailure {
     Retryable(anyhow::Error),
+    /// The server rejected the credentials during a reconnect. Retried, but
+    /// only `MAX_RECONNECT_CREDENTIAL_REJECTIONS` times, so a password
+    /// changed mid-session cannot lock the account.
+    CredentialsRejected(anyhow::Error),
     Fatal(anyhow::Error),
 }
 
@@ -1247,9 +1255,13 @@ impl ConnectFailure {
         Self::Fatal(error.into())
     }
 
+    fn credentials_rejected(&self) -> bool {
+        matches!(self, Self::CredentialsRejected(_))
+    }
+
     fn into_parts(self) -> (anyhow::Error, bool) {
         match self {
-            Self::Retryable(error) => (error, true),
+            Self::Retryable(error) | Self::CredentialsRejected(error) => (error, true),
             Self::Fatal(error) => (error, false),
         }
     }
@@ -1298,6 +1310,7 @@ async fn run(
     let mut session_trusted: Option<String> = config.expected_fingerprint.clone();
     let mut connected_once = false;
     let mut failures: u32 = 0;
+    let mut credential_rejections: u32 = 0;
     // Wake-on-LAN: parsed once; a packet goes out before every initial attempt
     // (a machine that is already awake simply ignores it).
     let wake_mac = config.wake_mac.as_deref().and_then(crate::wol::parse_mac);
@@ -1339,6 +1352,7 @@ async fn run(
             Ok((connection_result, framed)) => {
                 connected_once = true;
                 failures = 0;
+                credential_rejections = 0;
                 if audio.is_some() {
                     // Joined channel = the host accepted audio redirection; a
                     // missing join means it is disabled server-side (GPO or a
@@ -1388,6 +1402,9 @@ async fn run(
                 }
             }
             Err(failure) => {
+                if failure.credentials_rejected() {
+                    credential_rejections += 1;
+                }
                 let (error, retryable) = failure.into_parts();
                 // `{error:#}` keeps the underlying io/TLS/auth cause.
                 let reason = format!("{error:#}");
@@ -1417,7 +1434,8 @@ async fn run(
                         reason,
                         event: TerminalEvent::Disconnected,
                     }
-                } else if !retryable {
+                } else if !retryable || credential_rejections >= MAX_RECONNECT_CREDENTIAL_REJECTIONS
+                {
                     Outcome::Fail {
                         reason,
                         event: TerminalEvent::ReconnectFailed,
@@ -2911,15 +2929,18 @@ fn connector_failure(
     e: ConnectorError,
     retry_authentication_during_reconnect: bool,
 ) -> ConnectFailure {
+    let rejected = connector_credentials_rejected(e.kind());
     let retryable = match e.kind() {
         ConnectorErrorKind::Decode(_) => true,
         ConnectorErrorKind::Credssp(_) | ConnectorErrorKind::AccessDenied => {
-            retry_authentication_during_reconnect || !connector_credentials_rejected(e.kind())
+            retry_authentication_during_reconnect || !rejected
         }
         _ => false,
     };
     let error = connector_err(e);
-    if retryable {
+    if retryable && rejected {
+        ConnectFailure::CredentialsRejected(error)
+    } else if retryable {
         ConnectFailure::retryable(error)
     } else {
         ConnectFailure::fatal(error)
@@ -4066,7 +4087,9 @@ mod tests {
             "CredSSP",
             ironrdp::connector::ConnectorErrorKind::AccessDenied,
         );
-        let (_, retryable) = connector_failure(reconnect_rejection, true).into_parts();
+        let failure = connector_failure(reconnect_rejection, true);
+        assert!(failure.credentials_rejected());
+        let (_, retryable) = failure.into_parts();
         assert!(retryable);
     }
 
