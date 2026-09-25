@@ -479,6 +479,7 @@ impl AppDelegate {
             password,
             domain: connection.domain.clone(),
             authentication: opts.authentication,
+            allow_tls_without_nla: opts.allow_tls_without_nla,
             width,
             height,
             scale,

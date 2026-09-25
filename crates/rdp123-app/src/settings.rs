@@ -197,6 +197,7 @@ pub struct SettingsIvars {
     audio: Popup,
     graphics: Popup,
     avc444: Check,
+    allow_tls: Check,
     reconnect: Check,
     keep_alive: Check,
 
@@ -1086,6 +1087,11 @@ impl SettingsController {
             .constraintEqualToConstant(FIELD_W)
             .setActive(true);
         let pw_policy = popup(&["Remember (Keychain)", "Always ask"], dirty, 210.0);
+        let allow_tls = checkbox("Allow TLS without NLA");
+        allow_tls.setToolTip(Some(&NSString::from_str(
+            "For servers without NLA, such as xrdp. The password is sent to the server after \
+             the TLS handshake instead of being checked first.",
+        )));
         let res_mode = flexible_popup(&["Fit to window", "Fixed"], sel!(resModeChanged:));
         let res_w = text("1920", 70.0);
         let res_h = text("1080", 70.0);
@@ -1176,6 +1182,7 @@ impl SettingsController {
             field("Domain:", &domain, PasswordAuth),
             field("Password:", &password, PasswordAuth),
             field("Password handling:", &pw_policy, PasswordAuth),
+            control(&allow_tls, PasswordAuth),
             control(
                 &muted("Signs in interactively with your Microsoft account."),
                 EntraAuth,
@@ -1372,6 +1379,7 @@ impl SettingsController {
         *ivars.color.borrow_mut() = Some(color);
         *ivars.graphics.borrow_mut() = Some(graphics);
         *ivars.avc444.borrow_mut() = Some(avc444);
+        *ivars.allow_tls.borrow_mut() = Some(allow_tls);
         *ivars.compression.borrow_mut() = Some(compression);
         *ivars.fullscreen.borrow_mut() = Some(fullscreen);
         *ivars.remember_size.borrow_mut() = Some(remember_size);
@@ -1999,6 +2007,7 @@ impl SettingsController {
             self.set_popup(&iv.audio, index_of(&AUDIO, &c.rdp.audio));
             self.set_popup(&iv.graphics, index_of(&GRAPHICS, &c.rdp.graphics));
             self.set_check(&iv.avc444, c.rdp.avc444);
+            self.set_check(&iv.allow_tls, c.rdp.allow_tls_without_nla);
             self.set_check(&iv.reconnect, c.rdp.reconnect);
             self.set_check(&iv.keep_alive, c.rdp.keep_alive);
         } else {
@@ -2085,6 +2094,7 @@ impl SettingsController {
         let audio = AUDIO[self.popup_index(&iv.audio).clamp(0, 2) as usize];
         let graphics = GRAPHICS[self.popup_index(&iv.graphics).clamp(0, 1) as usize];
         let avc444 = self.check_on(&iv.avc444);
+        let allow_tls = self.check_on(&iv.allow_tls);
         let reconnect = self.check_on(&iv.reconnect);
         let keep_alive = self.check_on(&iv.keep_alive);
         let password = self.read_secure(&iv.password);
@@ -2140,6 +2150,7 @@ impl SettingsController {
         connection.rdp.audio = audio;
         connection.rdp.graphics = graphics;
         connection.rdp.avc444 = avc444;
+        connection.rdp.allow_tls_without_nla = allow_tls;
         connection.rdp.reconnect = reconnect;
         connection.rdp.keep_alive = keep_alive;
         connection.rdp.password_policy = pw_policy;
