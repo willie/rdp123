@@ -1211,6 +1211,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 enum SessionEnd {
     /// User closed the window (or dropped the handle) — do not reconnect.
     UserQuit,
+    /// The server ended the session on purpose (sign-out, another client took
+    /// the session, idle or admin disconnect) — do not reconnect.
+    RemoteEnded,
     /// Connection dropped — reconnect if enabled.
     Disconnected(String),
 }
@@ -1386,6 +1389,10 @@ async fn run(
                 .await
                 {
                     SessionEnd::UserQuit => Outcome::Stop,
+                    SessionEnd::RemoteEnded => Outcome::Fail {
+                        reason: REMOTE_ENDED.to_string(),
+                        event: TerminalEvent::Disconnected,
+                    },
                     SessionEnd::Disconnected(reason) => {
                         if config.reconnect {
                             Outcome::Retry {
@@ -1693,9 +1700,7 @@ async fn run_session(
                     )
                     .await
                     {
-                        Ok(true) => {
-                            break SessionEnd::Disconnected(REMOTE_ENDED.to_string());
-                        }
+                        Ok(true) => break SessionEnd::RemoteEnded,
                         Ok(false) => {}
                         Err(error) => break SessionEnd::Disconnected(format!("{error:#}")),
                     },
@@ -1741,7 +1746,7 @@ async fn run_session(
                             &mut remote_clip,
                             event_cb,
                         ).await {
-                            Ok(true) => break SessionEnd::Disconnected(REMOTE_ENDED.to_string()),
+                            Ok(true) => break SessionEnd::RemoteEnded,
                             Ok(false) => {
                                 if is_external_paste {
                                     last_input = tokio::time::Instant::now();
@@ -1786,7 +1791,7 @@ async fn run_session(
                     &mut reader, &out_tx, &mut active_stage, &mut image,
                     &activation_factory, &mut input_db, framebuffer, event_cb,
                 ).await {
-                    Ok(true) => break SessionEnd::Disconnected(REMOTE_ENDED.to_string()),
+                    Ok(true) => break SessionEnd::RemoteEnded,
                     Ok(false) => {}
                     Err(e) => break SessionEnd::Disconnected(format!("{e:#}")),
                 }
@@ -1806,7 +1811,7 @@ async fn run_session(
                             framebuffer,
                             event_cb,
                         ).await {
-                            Ok(true) => break SessionEnd::Disconnected(REMOTE_ENDED.to_string()),
+                            Ok(true) => break SessionEnd::RemoteEnded,
                             Ok(false) => {}
                             Err(e) => break SessionEnd::Disconnected(format!("{e:#}")),
                         },
@@ -2490,7 +2495,10 @@ async fn drain_outputs(
                 )
                 .await?;
             }
-            ActiveStageOutput::Terminate(_reason) => return Ok(true),
+            ActiveStageOutput::Terminate(reason) => {
+                tracing::info!("server ended the session: {reason}");
+                return Ok(true);
+            }
             // Pointer shapes are mirrored onto the native macOS cursor so the
             // remote shape (resize arrows, I-beam, hand) shows without the
             // laggy server-composited cursor.
