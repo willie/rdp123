@@ -2744,10 +2744,17 @@ fn translate_input(
                 });
             }
             InputEvent::Wheel { delta, horizontal } => {
-                ops.push(Operation::WheelRotations(WheelRotations {
-                    is_vertical: !horizontal,
-                    rotation_units: delta,
-                }));
+                // The wire field is 9-bit two's complement ([-256, 255]); larger
+                // values are truncated, so send them as several steps.
+                let mut remaining = i32::from(delta);
+                while remaining != 0 {
+                    let step = remaining.clamp(-256, 255);
+                    ops.push(Operation::WheelRotations(WheelRotations {
+                        is_vertical: !horizontal,
+                        rotation_units: step as i16,
+                    }));
+                    remaining -= step;
+                }
             }
         }
     }
@@ -3358,6 +3365,34 @@ mod tests {
             replies.extend(receiver.process(&payload).unwrap());
         }
         replies
+    }
+
+    #[test]
+    fn large_wheel_deltas_are_split_into_wire_sized_steps() {
+        for delta in [360i16, 256, -257, -1000, i16::MAX, i16::MIN] {
+            let (ops, _) = super::translate_input(
+                vec![InputEvent::Wheel {
+                    delta,
+                    horizontal: false,
+                }],
+                false,
+            );
+            let units: Vec<i16> = ops
+                .iter()
+                .map(|op| match op {
+                    super::Operation::WheelRotations(w) => w.rotation_units,
+                    _ => panic!("unexpected operation"),
+                })
+                .collect();
+            assert!(
+                units.iter().all(|u| (-256..=255).contains(u)),
+                "{delta}: {units:?}"
+            );
+            assert_eq!(
+                units.iter().map(|&u| i32::from(u)).sum::<i32>(),
+                i32::from(delta)
+            );
+        }
     }
 
     #[test]

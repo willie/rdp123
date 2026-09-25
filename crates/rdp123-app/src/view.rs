@@ -27,6 +27,9 @@ pub struct RdpViewIvars {
     /// Opt-in bridge for external macOS speech-to-text tools that insert by
     /// invoking the focused application's standard Paste action.
     external_stt_paste_enabled: Cell<bool>,
+    /// Fractional wheel units (x, y) not yet sent, so slow trackpad scrolls
+    /// accumulate instead of rounding to zero on every event.
+    scroll_remainder: Cell<(f64, f64)>,
     /// Recycled presentation buffers (see `ui::upload_framebuffer`).
     present_pool: ui::PresentPool,
     /// Recycled IOSurfaces for zero-copy presentation.
@@ -245,14 +248,18 @@ define_class!(
         fn scroll_wheel(&self, event: &NSEvent) {
             let precise = event.hasPreciseScrollingDeltas();
             let factor = if precise { 4.0 } else { 120.0 };
-            let dy = event.scrollingDeltaY();
-            let dx = event.scrollingDeltaX();
+            let (rx, ry) = self.ivars().scroll_remainder.get();
+            let dy = ry + event.scrollingDeltaY() * factor;
+            let dx = rx + event.scrollingDeltaX() * factor;
+            let vy = dy.trunc() as i16;
+            let vx = dx.trunc() as i16;
+            self.ivars()
+                .scroll_remainder
+                .set((dx - f64::from(vx), dy - f64::from(vy)));
             let mut events = Vec::new();
-            let vy = (dy * factor) as i16;
             if vy != 0 {
                 events.push(InputEvent::Wheel { delta: vy, horizontal: false });
             }
-            let vx = (dx * factor) as i16;
             if vx != 0 {
                 events.push(InputEvent::Wheel { delta: vx, horizontal: true });
             }
