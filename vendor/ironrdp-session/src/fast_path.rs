@@ -186,11 +186,22 @@ impl Processor {
         bitmap_update: BitmapUpdateData<'_>,
     ) -> SessionResult<Vec<UpdateKind>> {
         let mut buf = Vec::new();
+        let mut clipped = Vec::new();
         let mut update_kind = UpdateKind::None;
 
         for update in bitmap_update.rectangles {
             trace!("{update:?}");
             buf.clear();
+
+            // The apply functions read rows of `rectangle.width()` pixels, but
+            // the bitmap's rows are `update.width` pixels, which servers such
+            // as xrdp round up past the destination rectangle.
+            let width = usize::from(update.width);
+            let height = usize::from(update.height);
+            if usize::from(update.rectangle.width()) > width || usize::from(update.rectangle.height()) > height {
+                warn!("Skipping bitmap {width}x{height} smaller than {:?}", update.rectangle);
+                continue;
+            }
 
             // Bitmap data is either compressed or uncompressed, depending
             // on whether the BITMAP_COMPRESSION flag is present in the
@@ -208,10 +219,13 @@ impl Processor {
                     match self.bitmap_stream_decoder.decode_bitmap_stream_to_rgb24(
                         update.bitmap_data,
                         &mut buf,
-                        usize::from(update.width),
-                        usize::from(update.height),
+                        width,
+                        height,
                     ) {
-                        Ok(()) => image.apply_rgb24(&buf, &update.rectangle, true)?,
+                        Ok(()) => {
+                            clip_bitmap(&buf, width * 3, height, 3, &update.rectangle, &mut clipped);
+                            image.apply_rgb24(&clipped, &update.rectangle, true)?
+                        }
                         Err(err) => {
                             warn!("Invalid RDP6_BITMAP_STREAM: {err}");
                             update.rectangle.clone()
@@ -226,15 +240,32 @@ impl Processor {
                     match ironrdp_graphics::rle::decompress(
                         update.bitmap_data,
                         &mut buf,
-                        usize::from(update.width),
-                        usize::from(update.height),
+                        width,
+                        height,
                         usize::from(update.bits_per_pixel),
                     ) {
-                        Ok(RlePixelFormat::Rgb16) => image.apply_rgb16_bitmap(&buf, &update.rectangle)?,
-                        Ok(RlePixelFormat::Rgb15) => image.apply_rgb15_bitmap(&buf, &update.rectangle)?,
-                        Ok(RlePixelFormat::Rgb24) => image.apply_bgr24_bitmap(&buf, &update.rectangle)?,
-                        Ok(RlePixelFormat::Rgb8) => {
-                            image.apply_rgb8_with_palette(&buf, &update.rectangle, self.palette.colors())?
+                        Ok(format) => {
+                            let bytes_per_pixel = match format {
+                                RlePixelFormat::Rgb24 => 3,
+                                RlePixelFormat::Rgb16 | RlePixelFormat::Rgb15 => 2,
+                                RlePixelFormat::Rgb8 => 1,
+                            };
+                            clip_bitmap(
+                                &buf,
+                                width * bytes_per_pixel,
+                                height,
+                                bytes_per_pixel,
+                                &update.rectangle,
+                                &mut clipped,
+                            );
+                            match format {
+                                RlePixelFormat::Rgb16 => image.apply_rgb16_bitmap(&clipped, &update.rectangle)?,
+                                RlePixelFormat::Rgb15 => image.apply_rgb15_bitmap(&clipped, &update.rectangle)?,
+                                RlePixelFormat::Rgb24 => image.apply_bgr24_bitmap(&clipped, &update.rectangle)?,
+                                RlePixelFormat::Rgb8 => {
+                                    image.apply_rgb8_with_palette(&clipped, &update.rectangle, self.palette.colors())?
+                                }
+                            }
                         }
 
                         Err(e) => {
@@ -251,46 +282,29 @@ impl Processor {
                 trace!("Uncompressed raw bitmap");
 
                 let bpp = usize::from(update.bits_per_pixel);
-                let width = usize::from(update.width);
                 let bytes_per_pixel = bpp.div_ceil(8);
-                let row_bytes = width * bytes_per_pixel;
-                let padded_row_bytes = (row_bytes + 3) & !3;
+                let padded_row_bytes = (width * bytes_per_pixel + 3) & !3;
 
-                if padded_row_bytes != row_bytes {
-                    // Strip per-row padding before passing to the bitmap apply functions,
-                    // which expect tightly packed pixel data.
-                    buf.clear();
-                    for row in update.bitmap_data.chunks(padded_row_bytes) {
-                        let end = row_bytes.min(row.len());
-                        buf.extend_from_slice(&row[..end]);
-                    }
+                // Strips the per-row padding along with the columns and rows
+                // outside the rectangle.
+                clip_bitmap(
+                    update.bitmap_data,
+                    padded_row_bytes,
+                    height,
+                    bytes_per_pixel,
+                    &update.rectangle,
+                    &mut clipped,
+                );
 
-                    match update.bits_per_pixel {
-                        8 => image.apply_rgb8_with_palette(&buf, &update.rectangle, self.palette.colors())?,
-                        15 => image.apply_rgb15_bitmap(&buf, &update.rectangle)?,
-                        16 => image.apply_rgb16_bitmap(&buf, &update.rectangle)?,
-                        24 => image.apply_bgr24_bitmap(&buf, &update.rectangle)?,
-                        32 => image.apply_rgb32_bitmap(&buf, PixelFormat::BgrX32, &update.rectangle)?,
-                        _ => {
-                            warn!("Unsupported uncompressed bitmap depth: {bpp} bpp");
-                            update.rectangle.clone()
-                        }
-                    }
-                } else {
-                    match update.bits_per_pixel {
-                        8 => image.apply_rgb8_with_palette(
-                            update.bitmap_data,
-                            &update.rectangle,
-                            self.palette.colors(),
-                        )?,
-                        15 => image.apply_rgb15_bitmap(update.bitmap_data, &update.rectangle)?,
-                        16 => image.apply_rgb16_bitmap(update.bitmap_data, &update.rectangle)?,
-                        24 => image.apply_bgr24_bitmap(update.bitmap_data, &update.rectangle)?,
-                        32 => image.apply_rgb32_bitmap(update.bitmap_data, PixelFormat::BgrX32, &update.rectangle)?,
-                        _ => {
-                            warn!("Unsupported uncompressed bitmap depth: {bpp} bpp");
-                            update.rectangle.clone()
-                        }
+                match update.bits_per_pixel {
+                    8 => image.apply_rgb8_with_palette(&clipped, &update.rectangle, self.palette.colors())?,
+                    15 => image.apply_rgb15_bitmap(&clipped, &update.rectangle)?,
+                    16 => image.apply_rgb16_bitmap(&clipped, &update.rectangle)?,
+                    24 => image.apply_bgr24_bitmap(&clipped, &update.rectangle)?,
+                    32 => image.apply_rgb32_bitmap(&clipped, PixelFormat::BgrX32, &update.rectangle)?,
+                    _ => {
+                        warn!("Unsupported uncompressed bitmap depth: {bpp} bpp");
+                        update.rectangle.clone()
                     }
                 }
             };
@@ -588,6 +602,27 @@ fn qoi_apply(
     Ok(())
 }
 
+/// Copies the part of a bottom-up bitmap that `rectangle` covers into `dst`:
+/// the first `rectangle.width()` pixels of each of the top
+/// `rectangle.height()` rows, tightly packed. `row_stride` is the byte length
+/// of one source row, including any padding.
+fn clip_bitmap(
+    src: &[u8],
+    row_stride: usize,
+    height: usize,
+    bytes_per_pixel: usize,
+    rectangle: &InclusiveRectangle,
+    dst: &mut Vec<u8>,
+) {
+    let row_bytes = usize::from(rectangle.width()) * bytes_per_pixel;
+    let rows = usize::from(rectangle.height());
+    dst.clear();
+    // Bottom-up: the top image rows are the last rows in `src`.
+    for row in src.chunks(row_stride).take(height).skip(height - rows) {
+        dst.extend_from_slice(&row[..row_bytes.min(row.len())]);
+    }
+}
+
 pub struct ProcessorBuilder {
     pub io_channel_id: u16,
     pub user_channel_id: u16,
@@ -707,6 +742,63 @@ impl FrameMarkerProcessor {
                 .map_err(SessionError::encode)?;
 
                 Ok(())
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ironrdp_graphics::image_processing::PixelFormat;
+    use ironrdp_pdu::bitmap::{BitmapData, BitmapUpdateData, Compression};
+    use ironrdp_pdu::geometry::InclusiveRectangle;
+
+    use super::ProcessorBuilder;
+    use crate::image::DecodedImage;
+
+    #[test]
+    fn bitmap_wider_than_its_rectangle_is_cropped_per_row() {
+        // A 4x2 uncompressed 24 bpp bitmap (bottom-up BGR) drawn into a 3x2
+        // rectangle, as xrdp sends it. Pixel (x, y) is B=x, G=y, R=0x80.
+        let mut data = Vec::new();
+        for y in [1u8, 0] {
+            for x in 0..4u8 {
+                data.extend_from_slice(&[x, y, 0x80]);
+            }
+        }
+        let update = BitmapUpdateData {
+            rectangles: vec![BitmapData {
+                rectangle: InclusiveRectangle {
+                    left: 0,
+                    top: 0,
+                    right: 2,
+                    bottom: 1,
+                },
+                width: 4,
+                height: 2,
+                bits_per_pixel: 24,
+                compression_flags: Compression::empty(),
+                compressed_data_header: None,
+                bitmap_data: &data,
+            }],
+        };
+        let mut processor = ProcessorBuilder {
+            io_channel_id: 0,
+            user_channel_id: 0,
+            share_id: 0,
+            enable_server_pointer: false,
+            pointer_software_rendering: false,
+            bulk_decompressor: None,
+        }
+        .build();
+        let mut image = DecodedImage::new(PixelFormat::RgbA32, 4, 2);
+        processor.process_bitmap_update(&mut image, update).unwrap();
+
+        for y in 0..2u8 {
+            for x in 0..4u8 {
+                let i = (usize::from(y) * 4 + usize::from(x)) * 4;
+                let expected = if x < 3 { [0x80, y, x, 0xFF] } else { [0, 0, 0, 0] };
+                assert_eq!(&image.data()[i..i + 4], &expected, "pixel ({x}, {y})");
             }
         }
     }
