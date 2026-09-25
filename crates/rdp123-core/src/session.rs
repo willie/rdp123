@@ -1191,6 +1191,10 @@ enum ClipSignal {
 
 /// Give up after this many consecutive failed reconnect attempts.
 const MAX_RECONNECT_FAILURES: u32 = 20;
+/// Give up on the reconnect run at this many credential rejections. One
+/// retry covers a host that briefly refuses sign-in while rebooting; more
+/// risks an account lockout.
+const MAX_RECONNECT_CREDENTIAL_REJECTIONS: u32 = 2;
 /// Attempts for the very first connect. A few retries let a just-granted macOS
 /// Local Network permission (or a transient blip) succeed instead of failing.
 const MAX_INITIAL_FAILURES: u32 = 4;
@@ -1207,6 +1211,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 enum SessionEnd {
     /// User closed the window (or dropped the handle) — do not reconnect.
     UserQuit,
+    /// The server ended the session on purpose (sign-out, another client took
+    /// the session, idle or admin disconnect) — do not reconnect.
+    RemoteEnded,
     /// Connection dropped — reconnect if enabled.
     Disconnected(String),
 }
@@ -1235,6 +1242,10 @@ enum TerminalEvent {
 
 enum ConnectFailure {
     Retryable(anyhow::Error),
+    /// The server rejected the credentials during a reconnect. Retried, but
+    /// only `MAX_RECONNECT_CREDENTIAL_REJECTIONS` times, so a password
+    /// changed mid-session cannot lock the account.
+    CredentialsRejected(anyhow::Error),
     Fatal(anyhow::Error),
 }
 
@@ -1247,9 +1258,13 @@ impl ConnectFailure {
         Self::Fatal(error.into())
     }
 
+    fn credentials_rejected(&self) -> bool {
+        matches!(self, Self::CredentialsRejected(_))
+    }
+
     fn into_parts(self) -> (anyhow::Error, bool) {
         match self {
-            Self::Retryable(error) => (error, true),
+            Self::Retryable(error) | Self::CredentialsRejected(error) => (error, true),
             Self::Fatal(error) => (error, false),
         }
     }
@@ -1298,6 +1313,7 @@ async fn run(
     let mut session_trusted: Option<String> = config.expected_fingerprint.clone();
     let mut connected_once = false;
     let mut failures: u32 = 0;
+    let mut credential_rejections: u32 = 0;
     // Wake-on-LAN: parsed once; a packet goes out before every initial attempt
     // (a machine that is already awake simply ignores it).
     let wake_mac = config.wake_mac.as_deref().and_then(crate::wol::parse_mac);
@@ -1339,6 +1355,7 @@ async fn run(
             Ok((connection_result, framed)) => {
                 connected_once = true;
                 failures = 0;
+                credential_rejections = 0;
                 if audio.is_some() {
                     // Joined channel = the host accepted audio redirection; a
                     // missing join means it is disabled server-side (GPO or a
@@ -1372,6 +1389,10 @@ async fn run(
                 .await
                 {
                     SessionEnd::UserQuit => Outcome::Stop,
+                    SessionEnd::RemoteEnded => Outcome::Fail {
+                        reason: REMOTE_ENDED.to_string(),
+                        event: TerminalEvent::Disconnected,
+                    },
                     SessionEnd::Disconnected(reason) => {
                         if config.reconnect {
                             Outcome::Retry {
@@ -1388,6 +1409,9 @@ async fn run(
                 }
             }
             Err(failure) => {
+                if failure.credentials_rejected() {
+                    credential_rejections += 1;
+                }
                 let (error, retryable) = failure.into_parts();
                 // `{error:#}` keeps the underlying io/TLS/auth cause.
                 let reason = format!("{error:#}");
@@ -1417,7 +1441,8 @@ async fn run(
                         reason,
                         event: TerminalEvent::Disconnected,
                     }
-                } else if !retryable {
+                } else if !retryable || credential_rejections >= MAX_RECONNECT_CREDENTIAL_REJECTIONS
+                {
                     Outcome::Fail {
                         reason,
                         event: TerminalEvent::ReconnectFailed,
@@ -1675,9 +1700,7 @@ async fn run_session(
                     )
                     .await
                     {
-                        Ok(true) => {
-                            break SessionEnd::Disconnected(REMOTE_ENDED.to_string());
-                        }
+                        Ok(true) => break SessionEnd::RemoteEnded,
                         Ok(false) => {}
                         Err(error) => break SessionEnd::Disconnected(format!("{error:#}")),
                     },
@@ -1723,7 +1746,7 @@ async fn run_session(
                             &mut remote_clip,
                             event_cb,
                         ).await {
-                            Ok(true) => break SessionEnd::Disconnected(REMOTE_ENDED.to_string()),
+                            Ok(true) => break SessionEnd::RemoteEnded,
                             Ok(false) => {
                                 if is_external_paste {
                                     last_input = tokio::time::Instant::now();
@@ -1768,7 +1791,7 @@ async fn run_session(
                     &mut reader, &out_tx, &mut active_stage, &mut image,
                     &activation_factory, &mut input_db, framebuffer, event_cb,
                 ).await {
-                    Ok(true) => break SessionEnd::Disconnected(REMOTE_ENDED.to_string()),
+                    Ok(true) => break SessionEnd::RemoteEnded,
                     Ok(false) => {}
                     Err(e) => break SessionEnd::Disconnected(format!("{e:#}")),
                 }
@@ -1788,7 +1811,7 @@ async fn run_session(
                             framebuffer,
                             event_cb,
                         ).await {
-                            Ok(true) => break SessionEnd::Disconnected(REMOTE_ENDED.to_string()),
+                            Ok(true) => break SessionEnd::RemoteEnded,
                             Ok(false) => {}
                             Err(e) => break SessionEnd::Disconnected(format!("{e:#}")),
                         },
@@ -2472,7 +2495,10 @@ async fn drain_outputs(
                 )
                 .await?;
             }
-            ActiveStageOutput::Terminate(_reason) => return Ok(true),
+            ActiveStageOutput::Terminate(reason) => {
+                tracing::info!("server ended the session: {reason}");
+                return Ok(true);
+            }
             // Pointer shapes are mirrored onto the native macOS cursor so the
             // remote shape (resize arrows, I-beam, hand) shows without the
             // laggy server-composited cursor.
@@ -2718,10 +2744,17 @@ fn translate_input(
                 });
             }
             InputEvent::Wheel { delta, horizontal } => {
-                ops.push(Operation::WheelRotations(WheelRotations {
-                    is_vertical: !horizontal,
-                    rotation_units: delta,
-                }));
+                // The wire field is 9-bit two's complement ([-256, 255]); larger
+                // values are truncated, so send them as several steps.
+                let mut remaining = i32::from(delta);
+                while remaining != 0 {
+                    let step = remaining.clamp(-256, 255);
+                    ops.push(Operation::WheelRotations(WheelRotations {
+                        is_vertical: !horizontal,
+                        rotation_units: step as i16,
+                    }));
+                    remaining -= step;
+                }
             }
         }
     }
@@ -2911,15 +2944,18 @@ fn connector_failure(
     e: ConnectorError,
     retry_authentication_during_reconnect: bool,
 ) -> ConnectFailure {
+    let rejected = connector_credentials_rejected(e.kind());
     let retryable = match e.kind() {
         ConnectorErrorKind::Decode(_) => true,
         ConnectorErrorKind::Credssp(_) | ConnectorErrorKind::AccessDenied => {
-            retry_authentication_during_reconnect || !connector_credentials_rejected(e.kind())
+            retry_authentication_during_reconnect || !rejected
         }
         _ => false,
     };
     let error = connector_err(e);
-    if retryable {
+    if retryable && rejected {
+        ConnectFailure::CredentialsRejected(error)
+    } else if retryable {
         ConnectFailure::retryable(error)
     } else {
         ConnectFailure::fatal(error)
@@ -3329,6 +3365,34 @@ mod tests {
             replies.extend(receiver.process(&payload).unwrap());
         }
         replies
+    }
+
+    #[test]
+    fn large_wheel_deltas_are_split_into_wire_sized_steps() {
+        for delta in [360i16, 256, -257, -1000, i16::MAX, i16::MIN] {
+            let (ops, _) = super::translate_input(
+                vec![InputEvent::Wheel {
+                    delta,
+                    horizontal: false,
+                }],
+                false,
+            );
+            let units: Vec<i16> = ops
+                .iter()
+                .map(|op| match op {
+                    super::Operation::WheelRotations(w) => w.rotation_units,
+                    _ => panic!("unexpected operation"),
+                })
+                .collect();
+            assert!(
+                units.iter().all(|u| (-256..=255).contains(u)),
+                "{delta}: {units:?}"
+            );
+            assert_eq!(
+                units.iter().map(|&u| i32::from(u)).sum::<i32>(),
+                i32::from(delta)
+            );
+        }
     }
 
     #[test]
@@ -4066,7 +4130,9 @@ mod tests {
             "CredSSP",
             ironrdp::connector::ConnectorErrorKind::AccessDenied,
         );
-        let (_, retryable) = connector_failure(reconnect_rejection, true).into_parts();
+        let failure = connector_failure(reconnect_rejection, true);
+        assert!(failure.credentials_rejected());
+        let (_, retryable) = failure.into_parts();
         assert!(retryable);
     }
 

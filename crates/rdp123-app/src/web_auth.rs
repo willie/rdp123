@@ -10,7 +10,7 @@ use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{NSObject, NSObjectProtocol, NSString, NSURLRequest, NSURL};
 use objc2_web_kit::{
     WKNavigationAction, WKNavigationActionPolicy, WKNavigationDelegate, WKWebView,
-    WKWebViewConfiguration,
+    WKWebViewConfiguration, WKWebsiteDataStore,
 };
 use tokio::sync::oneshot;
 use url::Url;
@@ -100,6 +100,10 @@ impl WebAuthController {
         window.setDelegate(Some(ProtocolObject::from_ref(self)));
 
         let configuration = unsafe { WKWebViewConfiguration::new(mtm) };
+        // Keep Microsoft's sign-in cookies in memory only, like the tokens.
+        unsafe {
+            configuration.setWebsiteDataStore(&WKWebsiteDataStore::nonPersistentDataStore(mtm))
+        };
         let web_view = unsafe {
             WKWebView::initWithFrame_configuration(WKWebView::alloc(mtm), frame, &configuration)
         };

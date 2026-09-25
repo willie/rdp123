@@ -246,6 +246,11 @@ impl GfxHandler {
         height: u16,
         origin: Option<(u32, u32)>,
     ) {
+        let max = crate::profile::MAX_REMOTE_DIMENSION;
+        if width > max || height > max {
+            tracing::warn!("egfx: refusing {width}x{height} surface {surface_id}");
+            return;
+        }
         let mut buf = match self.retired_surfaces.remove(&surface_id) {
             Some(old) if old.width == width && old.height == height => {
                 tracing::debug!(
@@ -280,6 +285,13 @@ impl GfxHandler {
         // RGBA (decoder output) -> BGRA (framebuffer layout), row by row so a
         // decoder buffer wider than the destination is cropped correctly.
         let src_stride = usize::from(data_width) * BPP;
+        if rgba.len() < (h - 1) * src_stride + w * BPP {
+            tracing::warn!(
+                "egfx: dropping {data_width}x{data_height} bitmap with only {} bytes",
+                rgba.len()
+            );
+            return;
+        }
         let mut bgra = vec![0u8; w * h * BPP];
         for row in 0..h {
             let src_row = &rgba[row * src_stride..row * src_stride + w * BPP];
@@ -311,6 +323,8 @@ impl GfxHandler {
         let Some((ox, oy)) = surface.origin else {
             return;
         };
+        let right = right.min(usize::from(surface.width));
+        let bottom = bottom.min(usize::from(surface.height));
         if left >= right || top >= bottom {
             return;
         }
@@ -1135,6 +1149,50 @@ mod tests {
         assert_eq!(px[4], 10); // A (copied)
         assert_eq!(px[8], 20); // B (copied)
         assert_eq!(px[12], 40); // D untouched
+    }
+
+    #[test]
+    fn cache_to_surface_past_edge_is_clipped() {
+        let mut handler = handler_with_surface(4, 4);
+        handler.surfaces.get_mut(&0).unwrap().origin = Some((0, 0));
+        handler.cache.insert(1, (2, 2, vec![9; 2 * 2 * BPP]));
+        let pdu = CacheToSurfacePdu {
+            cache_slot: 1,
+            surface_id: 0,
+            destination_points: vec![ironrdp_egfx::pdu::Point { x: 3, y: 3 }],
+        };
+        handler.on_cache_to_surface(&pdu);
+        let px = &handler.surfaces[&0].pixels;
+        assert_eq!(&px[15 * BPP..16 * BPP], &[9; BPP]); // (3,3)
+    }
+
+    #[test]
+    fn surface_to_surface_past_edge_is_clipped() {
+        let mut handler = handler_with_surface(4, 4);
+        handler.surfaces.get_mut(&0).unwrap().origin = Some((0, 0));
+        let pdu = SurfaceToSurfacePdu {
+            source_surface_id: 0,
+            destination_surface_id: 0,
+            source_rectangle: rect(0, 0, 2, 2),
+            destination_points: vec![ironrdp_egfx::pdu::Point { x: 3, y: 3 }],
+        };
+        handler.on_surface_to_surface(&pdu);
+    }
+
+    #[test]
+    fn bitmap_shorter_than_its_size_is_ignored() {
+        let mut handler = handler_with_surface(4, 4);
+        let rgba = [0x11, 0x22, 0x33, 0xFF].repeat(4); // one row of a 4x4 update
+        handler.apply_bitmap(0, &rect(0, 0, 4, 4), &rgba, 4, 4);
+        assert!(handler.surfaces[&0].pixels.iter().all(|&value| value == 0));
+    }
+
+    #[test]
+    fn oversized_surface_is_not_allocated() {
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = GfxHandler::new(SharedFramebuffer::new(), tx, true);
+        handler.create_surface_buffer(0, u16::MAX, u16::MAX, None);
+        assert!(!handler.surfaces.contains_key(&0));
     }
 
     #[test]
