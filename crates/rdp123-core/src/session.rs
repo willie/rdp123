@@ -963,6 +963,8 @@ pub struct SessionConfig {
     pub password: String,
     pub domain: Option<String>,
     pub authentication: AuthenticationMode,
+    /// Password authentication only: also offer TLS for servers without NLA.
+    pub allow_tls_without_nla: bool,
     pub width: u16,
     pub height: u16,
     pub scale: Option<u32>,
@@ -2773,7 +2775,10 @@ fn build_config(config: &SessionConfig, audio_active: bool) -> Config {
             height: config.height,
         },
         desktop_scale_factor: config.scale.unwrap_or(100),
-        enable_tls: false,
+        // Offering TLS lets a server downgrade from NLA, so it is opt-in per
+        // connection. Entra connections offer RDSAAD only.
+        enable_tls: config.authentication == AuthenticationMode::Password
+            && config.allow_tls_without_nla,
         enable_credssp: config.authentication == AuthenticationMode::Password,
         enable_rdsaad: config.authentication == AuthenticationMode::EntraWeb,
         credentials: Credentials::UsernamePassword {
@@ -2858,12 +2863,38 @@ fn connector_err(e: ConnectorError) -> anyhow::Error {
         ConnectorErrorKind::Negotiation(_) => {
             "The remote computer rejected the requested RDP security protocol.".to_string()
         }
-        ConnectorErrorKind::Reason(description) => {
-            format!("The remote computer rejected the connection: {description}")
-        }
+        ConnectorErrorKind::Reason(description) => security_mismatch_message(description)
+            .unwrap_or_else(|| {
+                format!("The remote computer rejected the connection: {description}")
+            }),
         _ => "The RDP connection could not be established.".to_string(),
     };
     anyhow!(message)
+}
+
+/// IronRDP reports a protocol the client did not offer as
+/// "client advertised {requested}, but server selected {selected}", with each
+/// side formatted as `SecurityProtocol` flags joined by " | ".
+fn security_mismatch_message(description: &str) -> Option<String> {
+    let (advertised, selected) = description
+        .strip_prefix("client advertised ")?
+        .split_once(", but server selected ")?;
+    let advertised: Vec<&str> = advertised.split(" | ").collect();
+    if advertised.contains(&"HYBRID") && !advertised.contains(&"SSL") {
+        return Some(
+            "The remote computer doesn't support NLA. Turn on “Allow TLS without NLA” for this \
+             connection in Settings."
+                .to_string(),
+        );
+    }
+    if selected == "STANDARD_RDP_SECURITY" {
+        return Some(
+            "The remote computer only offers legacy RDP security, which RDP123 doesn't support. \
+             Configure it to use TLS (for xrdp, set security_layer=negotiate or tls)."
+                .to_string(),
+        );
+    }
+    None
 }
 
 fn connector_credentials_rejected(kind: &ConnectorErrorKind) -> bool {
@@ -3303,11 +3334,11 @@ mod tests {
         create_remote_clipboard_cache_dir, initial_keyboard_sync_event, mdns_fallback_hostname,
         next_remote_fetch_action, normalize_clipboard_to_crlf, plan_remote_clipboard_cache,
         remote_clipboard_paste_input_events, remote_top_level_destination, resolve_pending_command,
-        to_file_descriptors, update_keys_down, user_facing_disconnect_reason,
-        validate_remote_file_range, ClipSignal, InputEvent, LocalClip, LocalClipFile,
-        LocalClipState, LocalClipboardOfferResult, LocalClipboardState, MacClipboardBackend,
-        PendingCommands, RemoteClipboard, RemoteFetchAction, RemoteFileEntry, SessionCommand,
-        SessionConfig, SessionHandle, CLIPBOARD_RETRY_DELAYS,
+        security_mismatch_message, to_file_descriptors, update_keys_down,
+        user_facing_disconnect_reason, validate_remote_file_range, ClipSignal, InputEvent,
+        LocalClip, LocalClipFile, LocalClipState, LocalClipboardOfferResult, LocalClipboardState,
+        MacClipboardBackend, PendingCommands, RemoteClipboard, RemoteFetchAction, RemoteFileEntry,
+        SessionCommand, SessionConfig, SessionHandle, CLIPBOARD_RETRY_DELAYS,
     };
     use crate::profile::{AudioMode, AuthenticationMode, ClipboardMode, GraphicsMode};
     use ironrdp::cliprdr::backend::CliprdrBackend;
@@ -3332,6 +3363,7 @@ mod tests {
             password: "password".to_string(),
             domain: None,
             authentication: AuthenticationMode::Password,
+            allow_tls_without_nla: false,
             width: 1280,
             height: 720,
             scale: Some(100),
@@ -4273,6 +4305,41 @@ mod tests {
         let entra = build_config(&entra, false);
         assert!(!entra.enable_credssp);
         assert!(entra.enable_rdsaad);
+    }
+
+    #[test]
+    fn tls_is_offered_only_when_allowed_with_password_auth() {
+        let mut config = test_session_config(GraphicsMode::Classic, true);
+        assert!(!build_config(&config, false).enable_tls);
+
+        config.allow_tls_without_nla = true;
+        let password = build_config(&config, false);
+        assert!(password.enable_tls);
+        assert!(password.enable_credssp);
+
+        config.authentication = AuthenticationMode::EntraWeb;
+        assert!(!build_config(&config, false).enable_tls);
+    }
+
+    #[test]
+    fn security_mismatch_names_the_fix() {
+        let xrdp = security_mismatch_message(
+            "client advertised HYBRID | HYBRID_EX, but server selected STANDARD_RDP_SECURITY",
+        )
+        .unwrap();
+        assert!(xrdp.contains("Allow TLS without NLA"));
+
+        let legacy_only = security_mismatch_message(
+            "client advertised SSL | HYBRID | HYBRID_EX, but server selected STANDARD_RDP_SECURITY",
+        )
+        .unwrap();
+        assert!(legacy_only.contains("legacy RDP security"));
+
+        assert_eq!(
+            security_mismatch_message("client advertised RDSAAD, but server selected SSL"),
+            None
+        );
+        assert_eq!(security_mismatch_message("something else"), None);
     }
 
     #[test]

@@ -171,6 +171,10 @@ pub struct RdpOptions {
     /// Password/CredSSP or Microsoft Entra web authentication.
     #[serde(default)]
     pub authentication: AuthenticationMode,
+    /// Password authentication only: also offer TLS, so servers without NLA
+    /// (xrdp) can accept the connection. Standard RDP security stays refused.
+    #[serde(default)]
+    pub allow_tls_without_nla: bool,
     #[serde(default)]
     pub color_quality: ColorQuality,
     /// FastPath transport compression (RDP 6.1 XCRUSH), independent of the
@@ -226,6 +230,7 @@ impl Default for RdpOptions {
     fn default() -> Self {
         Self {
             authentication: AuthenticationMode::default(),
+            allow_tls_without_nla: false,
             color_quality: ColorQuality::default(),
             compression: true,
             clipboard: ClipboardMode::default(),
