@@ -28,14 +28,13 @@ use objc2_app_kit::{
     NSGridCellPlacement, NSGridRow, NSGridRowAlignment, NSGridView, NSImage, NSImageName,
     NSImageNameAddTemplate, NSImageNameRemoveTemplate, NSImageScaling, NSImageView,
     NSLayoutAttribute, NSLineBreakMode, NSLinkAttributeName, NSMenu, NSMenuItem,
-    NSMenuItemValidation, NSObjectNSKeyValueBindingCreation,
-    NSPasteboard, NSPasteboardTypeString, NSPopUpButton, NSScreen, NSScrollView, NSSecureTextField,
-    NSStackView, NSStackViewDistribution, NSStackViewGravity, NSTabView, NSTabViewController,
-    NSTabViewControllerTabStyle, NSTabViewItem, NSTableCellView, NSTableColumn, NSTableView,
-    NSTableViewColumnAutoresizingStyle, NSTableViewDataSource, NSTableViewDelegate,
-    NSTableViewStyle, NSTextField, NSTextFieldDelegate, NSTitleBinding,
-    NSUserInterfaceLayoutOrientation, NSView, NSViewController, NSWindow, NSWindowDelegate,
-    NSWindowStyleMask,
+    NSMenuItemValidation, NSObjectNSKeyValueBindingCreation, NSPasteboard, NSPasteboardTypeString,
+    NSPopUpButton, NSScreen, NSScrollView, NSSecureTextField, NSStackView, NSStackViewDistribution,
+    NSStackViewGravity, NSTabView, NSTabViewController, NSTabViewControllerTabStyle, NSTabViewItem,
+    NSTableCellView, NSTableColumn, NSTableView, NSTableViewColumnAutoresizingStyle,
+    NSTableViewDataSource, NSTableViewDelegate, NSTableViewStyle, NSTextField, NSTextFieldDelegate,
+    NSTitleBinding, NSUserInterfaceLayoutOrientation, NSView, NSViewController, NSWindow,
+    NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{
@@ -120,9 +119,9 @@ fn copy_name(name: &str, existing: &[Connection]) -> String {
         Some((base, rest))
             if !base.is_empty()
                 && (rest.is_empty()
-                    || rest
-                        .strip_prefix(' ')
-                        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))) =>
+                    || rest.strip_prefix(' ').is_some_and(|n| {
+                        !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+                    })) =>
         {
             base
         }
@@ -1656,7 +1655,12 @@ impl SettingsController {
 
     /// The row under the pointer when the list's context menu opened, or -1.
     fn clicked_row(&self) -> isize {
-        self.ivars().table.borrow().as_ref().map(|t| t.clickedRow()).unwrap_or(-1)
+        self.ivars()
+            .table
+            .borrow()
+            .as_ref()
+            .map(|t| t.clickedRow())
+            .unwrap_or(-1)
     }
 
     fn is_context_item(&self, item: &NSMenuItem) -> bool {
@@ -2250,7 +2254,10 @@ mod tests {
             "Work PC copy 2"
         );
         assert_eq!(
-            copy_name("Work PC", &named(&["Work PC", "Work PC copy", "Work PC copy 2"])),
+            copy_name(
+                "Work PC",
+                &named(&["Work PC", "Work PC copy", "Work PC copy 2"])
+            ),
             "Work PC copy 3"
         );
     }
@@ -2266,7 +2273,10 @@ mod tests {
     #[test]
     fn copy_inside_a_name_is_not_a_suffix() {
         assert_eq!(copy_name("copy", &named(&["copy"])), "copy copy");
-        assert_eq!(copy_name("Photocopy lab", &named(&[])), "Photocopy lab copy");
+        assert_eq!(
+            copy_name("Photocopy lab", &named(&[])),
+            "Photocopy lab copy"
+        );
         assert_eq!(copy_name("Box copy B", &named(&[])), "Box copy B copy");
     }
 
