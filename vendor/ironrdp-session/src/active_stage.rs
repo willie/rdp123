@@ -384,7 +384,7 @@ impl TryFrom<x224::ProcessorOutput> for ActiveStageOutput {
                         mcs::DisconnectReason::UserRequested => GracefulDisconnectReason::UserInitiated,
                         other => GracefulDisconnectReason::Other(other.description().to_owned()),
                     },
-                    x224::DisconnectDescription::ErrorInfo(info) => GracefulDisconnectReason::Other(info.description()),
+                    x224::DisconnectDescription::ErrorInfo(info) => GracefulDisconnectReason::ErrorInfo(info),
                 };
 
                 Ok(Self::Terminate(desc))
@@ -407,6 +407,9 @@ impl TryFrom<x224::ProcessorOutput> for ActiveStageOutput {
 pub enum GracefulDisconnectReason {
     UserInitiated,
     ServerInitiated,
+    /// The server's Set Error Info PDU, kept as a code so callers can tell a
+    /// user logoff from a failure.
+    ErrorInfo(ironrdp_pdu::rdp::server_error_info::ErrorInfo),
     Other(String),
 }
 
@@ -415,6 +418,7 @@ impl GracefulDisconnectReason {
         match self {
             GracefulDisconnectReason::UserInitiated => "user initiated disconnect".to_owned(),
             GracefulDisconnectReason::ServerInitiated => "server initiated disconnect".to_owned(),
+            GracefulDisconnectReason::ErrorInfo(info) => info.description(),
             GracefulDisconnectReason::Other(description) => description.clone(),
         }
     }
